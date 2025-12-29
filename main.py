@@ -34,6 +34,7 @@ def get_version():
     # Fallback: read from pyproject.toml (for development)
     try:
         import tomllib
+
         pyproject_path = os.path.join(os.path.dirname(__file__), "pyproject.toml")
         with open(pyproject_path, "rb") as f:
             pyproject = tomllib.load(f)
@@ -116,35 +117,57 @@ class BackupWorker(QThread):
         self.db_config = db_config
 
     def run(self):
-        """Create backup of drop table."""
+        """Create backup of drop tables."""
         try:
             conn = mssql_python.connect(self.db_config)
             cursor = conn.cursor()
 
-            self.progress.emit("Creating backup...")
+            self.progress.emit("Creating backup of drop groups...")
 
-            # Drop backup table if it exists
+            # Backup _RefDropItemGroup
             cursor.execute("""
-                IF OBJECT_ID('_RefMonster_AssignedItemDrop_Backup', 'U') IS NOT NULL
-                    DROP TABLE _RefMonster_AssignedItemDrop_Backup
+                IF OBJECT_ID('_RefDropItemGroup_Backup', 'U') IS NOT NULL
+                    DROP TABLE _RefDropItemGroup_Backup
             """)
 
-            # Create backup table
             cursor.execute("""
                 SELECT *
-                INTO _RefMonster_AssignedItemDrop_Backup
-                FROM _RefMonster_AssignedItemDrop
+                INTO _RefDropItemGroup_Backup
+                FROM _RefDropItemGroup
+                WHERE CodeName128 LIKE 'RARE_%'
             """)
 
-            # Count rows
-            cursor.execute("SELECT COUNT(*) FROM _RefMonster_AssignedItemDrop_Backup")
-            count = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM _RefDropItemGroup_Backup")
+            group_count = cursor.fetchone()[0]
+
+            self.progress.emit("Creating backup of drop assignments...")
+
+            # Backup _RefMonster_AssignedItemRndDrop
+            cursor.execute("""
+                IF OBJECT_ID('_RefMonster_AssignedItemRndDrop_Backup', 'U') IS NOT NULL
+                    DROP TABLE _RefMonster_AssignedItemRndDrop_Backup
+            """)
+
+            cursor.execute("""
+                SELECT *
+                INTO _RefMonster_AssignedItemRndDrop_Backup
+                FROM _RefMonster_AssignedItemRndDrop
+                WHERE ItemGroupCodeName128 LIKE 'RARE_%'
+            """)
+
+            cursor.execute(
+                "SELECT COUNT(*) FROM _RefMonster_AssignedItemRndDrop_Backup"
+            )
+            assignment_count = cursor.fetchone()[0]
 
             conn.commit()
             conn.close()
 
             self.finished.emit(
-                True, f"Backup created successfully!\n{count} rows backed up."
+                True,
+                f"Backup created successfully!\n\n"
+                f"Drop groups backed up: {group_count}\n"
+                f"Assignments backed up: {assignment_count}",
             )
 
         except Exception as e:
@@ -162,41 +185,94 @@ class RestoreWorker(QThread):
         self.db_config = db_config
 
     def run(self):
-        """Restore drop table from backup."""
+        """Restore drop tables from backup."""
         try:
             conn = mssql_python.connect(self.db_config)
             cursor = conn.cursor()
 
-            self.progress.emit("Restoring from backup...")
+            self.progress.emit("Checking for backups...")
 
-            # Check if backup exists
+            # Check if both backups exist
             cursor.execute("""
                 SELECT COUNT(*)
                 FROM INFORMATION_SCHEMA.TABLES
-                WHERE TABLE_NAME = '_RefMonster_AssignedItemDrop_Backup'
+                WHERE TABLE_NAME = '_RefDropItemGroup_Backup'
             """)
             if cursor.fetchone()[0] == 0:
-                raise Exception("No backup found! Please create a backup first.")
+                raise Exception(
+                    "No drop group backup found! Please create a backup first."
+                )
 
-            # Clear current table
-            cursor.execute("DELETE FROM _RefMonster_AssignedItemDrop")
-            self.progress.emit("Cleared current data...")
-
-            # Restore from backup
             cursor.execute("""
-                INSERT INTO _RefMonster_AssignedItemDrop
-                SELECT * FROM _RefMonster_AssignedItemDrop_Backup
+                SELECT COUNT(*)
+                FROM INFORMATION_SCHEMA.TABLES
+                WHERE TABLE_NAME = '_RefMonster_AssignedItemRndDrop_Backup'
+            """)
+            if cursor.fetchone()[0] == 0:
+                raise Exception(
+                    "No assignment backup found! Please create a backup first."
+                )
+
+            # Check if backups have any data
+            cursor.execute("SELECT COUNT(*) FROM _RefDropItemGroup_Backup")
+            backup_group_count = cursor.fetchone()[0]
+
+            cursor.execute(
+                "SELECT COUNT(*) FROM _RefMonster_AssignedItemRndDrop_Backup"
+            )
+            backup_assignment_count = cursor.fetchone()[0]
+
+            if backup_group_count == 0 and backup_assignment_count == 0:
+                raise Exception(
+                    "Backup tables are empty!\n\n"
+                    "This likely means the backup was created before any rare drops were configured.\n"
+                    "Apply drop rates first, then create a new backup."
+                )
+
+            self.progress.emit("Clearing current rare drop entries...")
+
+            # Clear current rare entries from both tables
+            cursor.execute(
+                "DELETE FROM _RefMonster_AssignedItemRndDrop WHERE ItemGroupCodeName128 LIKE 'RARE_%'"
+            )
+            cursor.execute(
+                "DELETE FROM _RefDropItemGroup WHERE CodeName128 LIKE 'RARE_%'"
+            )
+
+            self.progress.emit("Restoring drop groups from backup...")
+
+            # Restore _RefDropItemGroup from backup
+            cursor.execute("""
+                INSERT INTO _RefDropItemGroup
+                SELECT * FROM _RefDropItemGroup_Backup
             """)
 
-            # Count rows
-            cursor.execute("SELECT COUNT(*) FROM _RefMonster_AssignedItemDrop")
-            count = cursor.fetchone()[0]
+            cursor.execute(
+                "SELECT COUNT(*) FROM _RefDropItemGroup WHERE CodeName128 LIKE 'RARE_%'"
+            )
+            group_count = cursor.fetchone()[0]
+
+            self.progress.emit("Restoring drop assignments from backup...")
+
+            # Restore _RefMonster_AssignedItemRndDrop from backup
+            cursor.execute("""
+                INSERT INTO _RefMonster_AssignedItemRndDrop
+                SELECT * FROM _RefMonster_AssignedItemRndDrop_Backup
+            """)
+
+            cursor.execute(
+                "SELECT COUNT(*) FROM _RefMonster_AssignedItemRndDrop WHERE ItemGroupCodeName128 LIKE 'RARE_%'"
+            )
+            assignment_count = cursor.fetchone()[0]
 
             conn.commit()
             conn.close()
 
             self.finished.emit(
-                True, f"Restore completed successfully!\n{count} rows restored."
+                True,
+                f"Restore completed successfully!\n\n"
+                f"Drop groups restored: {group_count}\n"
+                f"Assignments restored: {assignment_count}",
             )
 
         except Exception as e:
@@ -218,25 +294,67 @@ class DropRateWorker(QThread):
         self.level_distance = level_distance
 
     def run(self):
-        """Execute the drop rate update with optimized batch operations."""
+        """Execute the drop rate update using group-based approach."""
         try:
             start_time = time.time()
             conn = mssql_python.connect(self.db_config)
             cursor = conn.cursor()
 
-            # Step 1: Collect all items and their monster assignments
-            self.progress.emit("Step 1/4: Collecting items...")
-            self.progress_percent.emit(10, "Analyzing...")
+            # Step 0: Create backup if it doesn't exist (safety measure)
+            self.progress.emit("Checking for backup...")
+            self.progress_percent.emit(2, "Checking...")
 
-            all_assignments = []  # (monster_id, item_id, drop_ratio)
-            item_ids_to_delete = set()
-            total_monsters = 0
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM INFORMATION_SCHEMA.TABLES
+                WHERE TABLE_NAME IN ('_RefDropItemGroup_Backup', '_RefMonster_AssignedItemRndDrop_Backup')
+            """)
+            backup_exists = cursor.fetchone()[0] >= 2
+
+            if not backup_exists:
+                self.progress.emit(
+                    "Creating automatic backup before applying changes..."
+                )
+                self.progress_percent.emit(3, "Creating backup...")
+
+                # Create backup of drop groups
+                cursor.execute("""
+                    IF OBJECT_ID('_RefDropItemGroup_Backup', 'U') IS NOT NULL
+                        DROP TABLE _RefDropItemGroup_Backup
+                """)
+                cursor.execute("""
+                    SELECT *
+                    INTO _RefDropItemGroup_Backup
+                    FROM _RefDropItemGroup
+                    WHERE CodeName128 LIKE 'RARE_%'
+                """)
+
+                # Create backup of assignments
+                cursor.execute("""
+                    IF OBJECT_ID('_RefMonster_AssignedItemRndDrop_Backup', 'U') IS NOT NULL
+                        DROP TABLE _RefMonster_AssignedItemRndDrop_Backup
+                """)
+                cursor.execute("""
+                    SELECT *
+                    INTO _RefMonster_AssignedItemRndDrop_Backup
+                    FROM _RefMonster_AssignedItemRndDrop
+                    WHERE ItemGroupCodeName128 LIKE 'RARE_%'
+                """)
+
+                self.progress.emit("Backup created successfully")
+
+            # Step 1: Collect items and organize by (rare_type, level)
+            self.progress.emit("Step 1/6: Collecting items and organizing by level...")
+            self.progress_percent.emit(5, "Analyzing...")
+
+            # Dictionary: {(rare_type, level): [item_ids]}
+            items_by_type_level = {}
             item_count = 0
 
             for rare_type in self.rare_types:
                 cursor.execute(
                     """
-                    SELECT ID, CodeName128, ReqLevel1
+                    SELECT ID, ReqLevel1
                     FROM _RefObjCommon
                     WHERE CodeName128 LIKE ?
                     AND TypeID1 = 3
@@ -246,110 +364,207 @@ class DropRateWorker(QThread):
                 )
                 items = cursor.fetchall()
 
-                drop_ratio = self.probabilities[rare_type]
-
-                for item_id, item_name, item_level in items:
+                for item_id, item_level in items:
                     item_count += 1
-                    item_ids_to_delete.add(item_id)
+                    key = (rare_type, item_level)
+                    if key not in items_by_type_level:
+                        items_by_type_level[key] = []
+                    items_by_type_level[key].append(item_id)
 
-                    min_level = max(1, item_level - self.level_distance)
-                    max_level = item_level + self.level_distance
+                    if item_count % 100 == 0:
+                        self.progress.emit(f"Collected {item_count} items...")
 
-                    # Find monsters within level range
-                    cursor.execute(
-                        """
-                        SELECT c.ID
-                        FROM _RefObjCommon c
-                        JOIN _RefObjChar ch ON c.ID = ch.ID
-                        WHERE c.CodeName128 LIKE 'MOB_%'
-                        AND ch.Lvl BETWEEN ? AND ?
-                    """,
-                        (min_level, max_level),
-                    )
-
-                    monsters = cursor.fetchall()
-                    monster_count = len(monsters)
-                    total_monsters = max(total_monsters, monster_count)
-
-                    for (monster_id,) in monsters:
-                        all_assignments.append((monster_id, item_id, drop_ratio))
-
-                    if item_count % 10 == 0:
-                        self.progress.emit(
-                            f"Analyzed {item_count} items, {len(all_assignments)} assignments planned"
-                        )
-
-            total_assignments = len(all_assignments)
             self.progress.emit(
-                f"Step 1 complete: {item_count} items, {total_assignments} assignments to create"
+                f"Step 1 complete: {item_count} items organized into {len(items_by_type_level)} groups"
             )
-            self.progress_percent.emit(25, "Deleting old entries...")
+            self.progress_percent.emit(10, "Deleting old groups...")
 
-            # Step 2: Delete existing entries in batch
-            if item_ids_to_delete:
-                self.progress.emit(
-                    f"Step 2/4: Deleting old entries for {len(item_ids_to_delete)} items..."
-                )
+            # Step 2: Delete old rare drop groups from _RefDropItemGroup
+            self.progress.emit("Step 2/6: Deleting old rare drop groups...")
+            cursor.execute(
+                "DELETE FROM _RefDropItemGroup WHERE CodeName128 LIKE 'RARE_%'"
+            )
+            deleted_groups = cursor.rowcount
+            self.progress.emit(f"Deleted {deleted_groups} old rare drop group entries")
+            self.progress_percent.emit(15, "Creating new groups...")
 
-                # Delete in batches to avoid query size limits
-                item_id_list = list(item_ids_to_delete)
-                batch_size = 1000
-                for i in range(0, len(item_id_list), batch_size):
-                    batch = item_id_list[i : i + batch_size]
-                    placeholders = ",".join(["?" for _ in batch])
-                    cursor.execute(
-                        f"""
-                        DELETE FROM _RefMonster_AssignedItemDrop
-                        WHERE RefItemID IN ({placeholders})
-                    """,
-                        batch,
+            # Step 3: Create drop groups in _RefDropItemGroup
+            self.progress.emit("Step 3/6: Creating drop groups in _RefDropItemGroup...")
+
+            # Get next available group ID
+            cursor.execute("SELECT MAX(RefItemGroupID) FROM _RefDropItemGroup")
+            max_group_id = cursor.fetchone()[0] or 0
+            next_group_id = max_group_id + 1
+
+            # Track created groups: {(rare_type, level): group_id}
+            created_groups = {}
+            group_entries = []  # [(Service, RefItemGroupID, CodeName128, RefItemID, SelectRatio, RefMagicGroupID)]
+
+            for (rare_type, level), item_ids in items_by_type_level.items():
+                group_id = next_group_id
+                group_name = f"RARE_{rare_type}_LVL_{level}"
+                created_groups[(rare_type, level)] = group_id
+                next_group_id += 1
+
+                # Calculate equal SelectRatio for all items in group
+                select_ratio = 1.0 / len(item_ids)
+
+                for item_id in item_ids:
+                    group_entries.append(
+                        (1, group_id, group_name, item_id, select_ratio, 0)
                     )
-                    self.progress.emit(
-                        f"Deleted entries for {min(i + batch_size, len(item_id_list))}/{len(item_id_list)} items"
-                    )
 
-            self.progress_percent.emit(40, "Inserting new entries...")
-            self.progress.emit("Step 3/4: Inserting new drop entries...")
+            # Insert groups in batches
+            # SQL Server limit: 2100 parameters per query
+            # 6 columns per row = 2100/6 = 350 rows max
+            batch_size = 300  # Use 300 for safety margin
+            inserted_items = 0
+            for i in range(0, len(group_entries), batch_size):
+                batch = group_entries[i : i + batch_size]
 
-            # Step 3: Insert new entries in large batches
-            batch_size = 500  # SQL Server can handle up to 1000 rows per INSERT, use 500 for safety
-            inserted = 0
-
-            for i in range(0, total_assignments, batch_size):
-                batch = all_assignments[i : i + batch_size]
-
-                # Build batch INSERT statement
                 values_parts = []
                 params = []
-                for monster_id, item_id, drop_ratio in batch:
-                    values_parts.append(
-                        "(?, ?, 0, 0, 1, 1, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'xxx')"
+                for (
+                    service,
+                    group_id,
+                    group_name,
+                    item_id,
+                    select_ratio,
+                    magic_group,
+                ) in batch:
+                    values_parts.append("(?, ?, ?, ?, ?, ?)")
+                    params.extend(
+                        [
+                            service,
+                            group_id,
+                            group_name,
+                            item_id,
+                            select_ratio,
+                            magic_group,
+                        ]
                     )
-                    params.extend([monster_id, item_id, drop_ratio])
 
                 values_clause = ",".join(values_parts)
-
                 insert_sql = f"""
-                    INSERT INTO _RefMonster_AssignedItemDrop
-                    (RefMonsterID, RefItemID, DropGroupType, OptLevel,
-                     DropAmountMin, DropAmountMax, DropRatio,
-                     RefMagicOptionID1, CustomValue1, RefMagicOptionID2, CustomValue2,
-                     RefMagicOptionID3, CustomValue3, RefMagicOptionID4, CustomValue4,
-                     RefMagicOptionID5, CustomValue5, RefMagicOptionID6, CustomValue6,
-                     RefMagicOptionID7, CustomValue7, RefMagicOptionID8, CustomValue8,
-                     RefMagicOptionID9, CustomValue9, RentCodeName)
+                    INSERT INTO _RefDropItemGroup
+                    (Service, RefItemGroupID, CodeName128, RefItemID, SelectRatio, RefMagicGroupID)
                     VALUES {values_clause}
                 """
-
                 cursor.execute(insert_sql, params)
-                inserted += len(batch)
+                inserted_items += len(batch)
+
+                percentage = 15 + int((inserted_items / len(group_entries)) * 20)
+                self.progress_percent.emit(percentage, "Creating groups...")
+                self.progress.emit(
+                    f"Created {inserted_items}/{len(group_entries)} group item entries"
+                )
+
+            self.progress.emit(
+                f"Step 3 complete: Created {len(created_groups)} groups with {len(group_entries)} total items"
+            )
+            self.progress_percent.emit(35, "Deleting old assignments...")
+
+            # Step 4: Delete old rare assignments from _RefMonster_AssignedItemRndDrop
+            self.progress.emit("Step 4/6: Deleting old rare assignments...")
+            cursor.execute(
+                "DELETE FROM _RefMonster_AssignedItemRndDrop WHERE ItemGroupCodeName128 LIKE 'RARE_%'"
+            )
+            deleted_assignments = cursor.rowcount
+            self.progress.emit(
+                f"Deleted {deleted_assignments} old rare assignment entries"
+            )
+            self.progress_percent.emit(40, "Creating assignments...")
+
+            # Step 5: Create assignments in _RefMonster_AssignedItemRndDrop
+            self.progress.emit(
+                "Step 5/6: Creating assignments in _RefMonster_AssignedItemRndDrop..."
+            )
+
+            assignments = []  # [(Service, RefMonsterID, RefItemGroupID, ItemGroupCodeName128, Overlap, DropAmountMin, DropAmountMax, DropRatio, param1, param2)]
+
+            for (rare_type, level), group_id in created_groups.items():
+                group_name = f"RARE_{rare_type}_LVL_{level}"
+                drop_ratio = self.probabilities[rare_type]
+
+                min_level = max(0, level - self.level_distance)
+                max_level = level + self.level_distance
+
+                # Find monsters within level range
+                cursor.execute(
+                    """
+                    SELECT c.ID
+                    FROM _RefObjCommon c
+                    JOIN _RefObjChar ch ON c.ID = ch.ID
+                    WHERE c.CodeName128 LIKE 'MOB_%'
+                    AND ch.Lvl BETWEEN ? AND ?
+                """,
+                    (min_level, max_level),
+                )
+
+                monsters = cursor.fetchall()
+                for (monster_id,) in monsters:
+                    assignments.append(
+                        (1, monster_id, group_id, group_name, 0, 1, 1, drop_ratio, 0, 0)
+                    )
+
+                if len(created_groups) % 10 == 0:
+                    self.progress.emit(
+                        f"Planned assignments for {len(assignments)} monster-group pairs"
+                    )
+
+            # Insert assignments in batches
+            # SQL Server limit: 2100 parameters per query
+            # 10 columns per row = 2100/10 = 210 rows max
+            batch_size = 200  # Use 200 for safety margin
+            inserted_assignments = 0
+            for i in range(0, len(assignments), batch_size):
+                batch = assignments[i : i + batch_size]
+
+                values_parts = []
+                params = []
+                for (
+                    service,
+                    monster_id,
+                    group_id,
+                    group_name,
+                    overlap,
+                    drop_min,
+                    drop_max,
+                    drop_ratio,
+                    p1,
+                    p2,
+                ) in batch:
+                    values_parts.append("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                    params.extend(
+                        [
+                            service,
+                            monster_id,
+                            group_id,
+                            group_name,
+                            overlap,
+                            drop_min,
+                            drop_max,
+                            drop_ratio,
+                            p1,
+                            p2,
+                        ]
+                    )
+
+                values_clause = ",".join(values_parts)
+                insert_sql = f"""
+                    INSERT INTO _RefMonster_AssignedItemRndDrop
+                    (Service, RefMonsterID, RefItemGroupID, ItemGroupCodeName128, Overlap, DropAmountMin, DropAmountMax, DropRatio, param1, param2)
+                    VALUES {values_clause}
+                """
+                cursor.execute(insert_sql, params)
+                inserted_assignments += len(batch)
 
                 # Update progress
-                percentage = 40 + int((inserted / total_assignments) * 50)
+                percentage = 40 + int((inserted_assignments / len(assignments)) * 50)
                 elapsed_time = time.time() - start_time
-                if inserted > 0:
-                    time_per_insert = elapsed_time / inserted
-                    remaining = total_assignments - inserted
+                if inserted_assignments > 0:
+                    time_per_insert = elapsed_time / inserted_assignments
+                    remaining = len(assignments) - inserted_assignments
                     eta_seconds = int(time_per_insert * remaining)
 
                     if eta_seconds < 60:
@@ -365,12 +580,16 @@ class DropRateWorker(QThread):
 
                 self.progress_percent.emit(percentage, f"ETA: {eta_str}")
                 self.progress.emit(
-                    f"Inserted {inserted}/{total_assignments} assignments ({percentage - 40}% of inserts)"
+                    f"Created {inserted_assignments}/{len(assignments)} assignments"
                 )
 
+            self.progress.emit(
+                f"Step 5 complete: Created {len(assignments)} assignments"
+            )
             self.progress_percent.emit(90, "Committing...")
-            self.progress.emit("Step 4/4: Committing changes to database...")
 
+            # Step 6: Commit changes
+            self.progress.emit("Step 6/6: Committing changes to database...")
             conn.commit()
             conn.close()
 
@@ -386,14 +605,17 @@ class DropRateWorker(QThread):
             summary = (
                 f"Successfully updated drop rates in {elapsed_str}!\n\n"
                 f"Items processed: {item_count}\n"
-                f"Monsters affected: {total_monsters}\n"
-                f"Total assignments: {total_assignments}"
+                f"Drop groups created: {len(created_groups)}\n"
+                f"Monster-group assignments: {len(assignments)}"
             )
 
             self.finished.emit(True, summary)
 
         except Exception as e:
-            self.finished.emit(False, f"Error: {str(e)}")
+            import traceback
+
+            error_details = traceback.format_exc()
+            self.finished.emit(False, f"Error: {str(e)}\n\nDetails:\n{error_details}")
 
 
 class RareDropTool(QMainWindow):
@@ -402,7 +624,8 @@ class RareDropTool(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"Rare Item Drop Probability Tool v{__VERSION__}")
-        self.setGeometry(100, 100, 500, 400)
+        self.setGeometry(100, 100, 500, 550)
+        self.setMinimumSize(500, 550)  # Prevent window from being too small
 
         # Load database connection parameters from config file
         self.load_config()
@@ -482,17 +705,20 @@ class RareDropTool(QMainWindow):
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
 
-        # Progress bar with ETA (hidden by default)
+        # Progress bar with ETA (initially shows empty space to prevent layout shift)
         self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
         self.progress_bar.setMaximum(100)
+        self.progress_bar.setFixedHeight(25)
+        self.progress_bar.setTextVisible(False)  # Hide text initially
+        self.progress_bar.setValue(0)
         layout.addWidget(self.progress_bar)
 
-        # ETA label (hidden by default)
-        self.eta_label = QLabel("")
-        self.eta_label.setVisible(False)
+        # ETA label (initially shows empty space to prevent layout shift)
+        self.eta_label = QLabel(" ")  # Single space to maintain height
         self.eta_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.eta_label.setStyleSheet("padding: 5px; font-weight: bold;")
+        self.eta_label.setStyleSheet(
+            "padding: 5px; font-weight: bold; min-height: 20px;"
+        )
         layout.addWidget(self.eta_label)
 
         # Button layout - utility buttons
@@ -514,9 +740,12 @@ class RareDropTool(QMainWindow):
         backup_layout = QHBoxLayout()
 
         # Backup button
-        self.backup_button = QPushButton("Create Backup")
+        self.backup_button = QPushButton("Update Backup")
         self.backup_button.clicked.connect(self.create_backup)
         self.backup_button.setStyleSheet("padding: 8px;")
+        self.backup_button.setToolTip(
+            "Manually update the backup with current configuration (auto-created on apply)"
+        )
         backup_layout.addWidget(self.backup_button)
 
         # Restore button
@@ -552,6 +781,9 @@ class RareDropTool(QMainWindow):
 
         # Check if backup exists, create if not
         self.check_and_create_initial_backup()
+
+        # Load existing configuration from database if available
+        self.load_existing_config()
 
     def load_config(self):
         """Load database configuration from file or use defaults."""
@@ -675,33 +907,24 @@ class RareDropTool(QMainWindow):
             conn = mssql_python.connect(self.get_connection_string())
             cursor = conn.cursor()
 
-            # Check if backup table exists
+            # Check if both backup tables exist
             cursor.execute("""
                 SELECT COUNT(*)
                 FROM INFORMATION_SCHEMA.TABLES
-                WHERE TABLE_NAME = '_RefMonster_AssignedItemDrop_Backup'
+                WHERE TABLE_NAME IN ('_RefDropItemGroup_Backup', '_RefMonster_AssignedItemRndDrop_Backup')
             """)
-            backup_exists = cursor.fetchone()[0] > 0
+            backup_exists = cursor.fetchone()[0] >= 2  # Both tables must exist
+
             conn.close()
 
             if not backup_exists:
-                reply = QMessageBox.question(
-                    self,
-                    "First Run - Create Backup?",
-                    "No backup detected. This appears to be the first time running this tool.\n\n"
-                    "Would you like to create an initial backup of your drop table?\n"
-                    "This is highly recommended to restore original data if needed.",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.Yes,
+                # No backup - will be created automatically when user applies changes
+                self.status_label.setText(
+                    "No backup yet - Will be created automatically on first apply"
                 )
-
-                if reply == QMessageBox.StandardButton.Yes:
-                    self.create_backup()
-                else:
-                    self.status_label.setText("Warning: No backup exists")
-                    self.status_label.setStyleSheet(
-                        "padding: 10px; background-color: #fff3cd; color: #856404;"
-                    )
+                self.status_label.setStyleSheet(
+                    "padding: 10px; background-color: #e7f3ff; color: #004085;"
+                )
             else:
                 self.status_label.setText("Backup exists - Ready to use")
                 self.status_label.setStyleSheet(
@@ -715,14 +938,110 @@ class RareDropTool(QMainWindow):
                 "padding: 10px; background-color: #fff3cd; color: #856404;"
             )
 
+    def load_existing_config(self):
+        """Load existing rare drop configuration from database and populate UI."""
+        try:
+            conn = mssql_python.connect(self.get_connection_string())
+            cursor = conn.cursor()
+
+            # Query existing rare drop assignments to detect current configuration
+            cursor.execute("""
+                SELECT DISTINCT ItemGroupCodeName128, DropRatio
+                FROM _RefMonster_AssignedItemRndDrop
+                WHERE ItemGroupCodeName128 LIKE 'RARE_%'
+            """)
+
+            results = cursor.fetchall()
+            conn.close()
+
+            if not results:
+                # No existing configuration found
+                self.status_label.setText(
+                    "No existing configuration detected - Using defaults"
+                )
+                self.status_label.setStyleSheet(
+                    "padding: 10px; background-color: #e7f3ff; color: #004085;"
+                )
+                return
+
+            # Parse results to extract drop ratios by rare type
+            rare_configs = {"A": set(), "B": set(), "C": set()}
+
+            for group_name, drop_ratio in results:
+                # Group names are like: RARE_A_LVL_50, RARE_B_LVL_30, etc.
+                if "RARE_A_" in group_name:
+                    rare_configs["A"].add(drop_ratio)
+                elif "RARE_B_" in group_name:
+                    rare_configs["B"].add(drop_ratio)
+                elif "RARE_C_" in group_name:
+                    rare_configs["C"].add(drop_ratio)
+
+            # Update UI with detected values
+            config_summary = []
+
+            # Seal of Star (A_RARE)
+            if rare_configs["A"]:
+                # If all groups have the same ratio (expected), just take any one
+                # Convert set to list and take first value
+                star_ratio = list(rare_configs["A"])[0]
+                # Format with up to 6 significant figures, removing trailing zeros
+                star_ratio_str = f"{star_ratio:.6g}"
+                self.star_checkbox.setChecked(True)
+                self.star_prob_input.setText(star_ratio_str)
+                config_summary.append(f"Star: {star_ratio_str}")
+            else:
+                self.star_checkbox.setChecked(False)
+
+            # Seal of Moon (B_RARE)
+            if rare_configs["B"]:
+                moon_ratio = list(rare_configs["B"])[0]
+                moon_ratio_str = f"{moon_ratio:.6g}"
+                self.moon_checkbox.setChecked(True)
+                self.moon_prob_input.setText(moon_ratio_str)
+                config_summary.append(f"Moon: {moon_ratio_str}")
+            else:
+                self.moon_checkbox.setChecked(False)
+
+            # Seal of Sun (C_RARE)
+            if rare_configs["C"]:
+                sun_ratio = list(rare_configs["C"])[0]
+                sun_ratio_str = f"{sun_ratio:.6g}"
+                self.sun_checkbox.setChecked(True)
+                self.sun_prob_input.setText(sun_ratio_str)
+                config_summary.append(f"Sun: {sun_ratio_str}")
+            else:
+                self.sun_checkbox.setChecked(False)
+
+            # Update status label with detected configuration
+            if config_summary:
+                summary_text = ", ".join(config_summary)
+                self.status_label.setText(f"Loaded existing config: {summary_text}")
+                self.status_label.setStyleSheet(
+                    "padding: 10px; background-color: #d4edda; color: #155724;"
+                )
+            else:
+                self.status_label.setText("No rare drops configured in database")
+                self.status_label.setStyleSheet(
+                    "padding: 10px; background-color: #e7f3ff; color: #004085;"
+                )
+
+        except Exception:
+            # Don't fail startup if we can't load existing config
+            # Just use defaults silently or show a subtle warning
+            pass
+
     def create_backup(self):
-        """Create a backup of the drop table."""
+        """Create/update backup of the drop table."""
         reply = QMessageBox.question(
             self,
-            "Confirm Backup",
-            "This will overwrite any existing backup.\n\n"
-            "Current drop table will be backed up to:\n"
-            "_RefMonster_AssignedItemDrop_Backup\n\n"
+            "Update Backup",
+            "This will update the backup with the current rare drop configuration.\n\n"
+            "Note: Backups are automatically created before applying changes,\n"
+            "but you can manually update the backup here if needed.\n\n"
+            "Backup tables:\n"
+            "• _RefDropItemGroup_Backup\n"
+            "• _RefMonster_AssignedItemRndDrop_Backup\n\n"
+            "Only RARE_* entries will be backed up.\n\n"
             "Continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
@@ -736,8 +1055,9 @@ class RareDropTool(QMainWindow):
         self.test_button.setEnabled(False)
         self.backup_button.setEnabled(False)
         self.restore_button.setEnabled(False)
-        self.progress_bar.setVisible(True)
         self.progress_bar.setMaximum(0)  # Indeterminate
+        self.progress_bar.setTextVisible(True)
+        self.eta_label.setText("Processing...")
         self.status_label.setText("Creating backup...")
         self.status_label.setStyleSheet(
             "padding: 10px; background-color: #fff3cd; color: #856404;"
@@ -768,8 +1088,9 @@ class RareDropTool(QMainWindow):
         self.test_button.setEnabled(False)
         self.backup_button.setEnabled(False)
         self.restore_button.setEnabled(False)
-        self.progress_bar.setVisible(True)
         self.progress_bar.setMaximum(0)  # Indeterminate
+        self.progress_bar.setTextVisible(True)
+        self.eta_label.setText("Processing...")
         self.status_label.setText("Restoring from backup...")
         self.status_label.setStyleSheet(
             "padding: 10px; background-color: #fff3cd; color: #856404;"
@@ -788,8 +1109,10 @@ class RareDropTool(QMainWindow):
         self.test_button.setEnabled(True)
         self.backup_button.setEnabled(True)
         self.restore_button.setEnabled(True)
-        self.progress_bar.setVisible(False)
         self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(False)
+        self.eta_label.setText(" ")
 
         if success:
             QMessageBox.information(self, "Backup Complete", message)
@@ -811,8 +1134,10 @@ class RareDropTool(QMainWindow):
         self.test_button.setEnabled(True)
         self.backup_button.setEnabled(True)
         self.restore_button.setEnabled(True)
-        self.progress_bar.setVisible(False)
         self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(False)
+        self.eta_label.setText(" ")
 
         if success:
             QMessageBox.information(self, "Restore Complete", message)
@@ -880,7 +1205,9 @@ class RareDropTool(QMainWindow):
             "Confirm Action",
             f"This will update drop rates for:\n{types_str}\n\n"
             f"Level distance: ±{level_distance}\n\n"
-            f"This operation will DELETE existing drop entries for these items.\n"
+            f"⚠️  This operation will DELETE existing drop entries for these items.\n\n"
+            f"✓  A backup will be created automatically before applying changes.\n"
+            f"✓  You can restore from backup at any time.\n\n"
             f"Do you want to continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -894,9 +1221,8 @@ class RareDropTool(QMainWindow):
         self.test_button.setEnabled(False)
         self.backup_button.setEnabled(False)
         self.restore_button.setEnabled(False)
-        self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self.eta_label.setVisible(True)
+        self.progress_bar.setTextVisible(True)
         self.eta_label.setText("Starting...")
         self.status_label.setText("Processing...")
         self.status_label.setStyleSheet(
@@ -928,8 +1254,9 @@ class RareDropTool(QMainWindow):
         self.test_button.setEnabled(True)
         self.backup_button.setEnabled(True)
         self.restore_button.setEnabled(True)
-        self.progress_bar.setVisible(False)
-        self.eta_label.setVisible(False)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(False)
+        self.eta_label.setText(" ")
 
         if success:
             QMessageBox.information(self, "Success", message)
