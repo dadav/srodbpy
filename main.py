@@ -134,7 +134,6 @@ class BackupWorker(QThread):
                 SELECT *
                 INTO _RefDropItemGroup_Backup
                 FROM _RefDropItemGroup
-                WHERE CodeName128 LIKE 'RARE_%'
             """)
 
             cursor.execute("SELECT COUNT(*) FROM _RefDropItemGroup_Backup")
@@ -152,7 +151,6 @@ class BackupWorker(QThread):
                 SELECT *
                 INTO _RefMonster_AssignedItemRndDrop_Backup
                 FROM _RefMonster_AssignedItemRndDrop
-                WHERE ItemGroupCodeName128 LIKE 'RARE_%'
             """)
 
             cursor.execute(
@@ -225,19 +223,15 @@ class RestoreWorker(QThread):
             if backup_group_count == 0 and backup_assignment_count == 0:
                 raise Exception(
                     "Backup tables are empty!\n\n"
-                    "This likely means the backup was created before any rare drops were configured.\n"
-                    "Apply drop rates first, then create a new backup."
+                    "The backup contains no data. This should not happen.\n"
+                    "Please create a new backup before attempting to restore."
                 )
 
-            self.progress.emit("Clearing current rare drop entries...")
+            self.progress.emit("Clearing current data...")
 
-            # Clear current rare entries from both tables
-            cursor.execute(
-                "DELETE FROM _RefMonster_AssignedItemRndDrop WHERE ItemGroupCodeName128 LIKE 'RARE_%'"
-            )
-            cursor.execute(
-                "DELETE FROM _RefDropItemGroup WHERE CodeName128 LIKE 'RARE_%'"
-            )
+            # Clear all current rows from both tables
+            cursor.execute("DELETE FROM _RefMonster_AssignedItemRndDrop")
+            cursor.execute("DELETE FROM _RefDropItemGroup")
 
             self.progress.emit("Restoring drop groups from backup...")
 
@@ -247,9 +241,7 @@ class RestoreWorker(QThread):
                 SELECT * FROM _RefDropItemGroup_Backup
             """)
 
-            cursor.execute(
-                "SELECT COUNT(*) FROM _RefDropItemGroup WHERE CodeName128 LIKE 'RARE_%'"
-            )
+            cursor.execute("SELECT COUNT(*) FROM _RefDropItemGroup")
             group_count = cursor.fetchone()[0]
 
             self.progress.emit("Restoring drop assignments from backup...")
@@ -260,9 +252,7 @@ class RestoreWorker(QThread):
                 SELECT * FROM _RefMonster_AssignedItemRndDrop_Backup
             """)
 
-            cursor.execute(
-                "SELECT COUNT(*) FROM _RefMonster_AssignedItemRndDrop WHERE ItemGroupCodeName128 LIKE 'RARE_%'"
-            )
+            cursor.execute("SELECT COUNT(*) FROM _RefMonster_AssignedItemRndDrop")
             assignment_count = cursor.fetchone()[0]
 
             conn.commit()
@@ -317,7 +307,7 @@ class DropRateWorker(QThread):
                 )
                 self.progress_percent.emit(3, "Creating backup...")
 
-                # Create backup of drop groups
+                # Create backup of drop groups (all rows to preserve original state)
                 cursor.execute("""
                     IF OBJECT_ID('_RefDropItemGroup_Backup', 'U') IS NOT NULL
                         DROP TABLE _RefDropItemGroup_Backup
@@ -326,10 +316,9 @@ class DropRateWorker(QThread):
                     SELECT *
                     INTO _RefDropItemGroup_Backup
                     FROM _RefDropItemGroup
-                    WHERE CodeName128 LIKE 'RARE_%'
                 """)
 
-                # Create backup of assignments
+                # Create backup of assignments (all rows to preserve original state)
                 cursor.execute("""
                     IF OBJECT_ID('_RefMonster_AssignedItemRndDrop_Backup', 'U') IS NOT NULL
                         DROP TABLE _RefMonster_AssignedItemRndDrop_Backup
@@ -338,7 +327,6 @@ class DropRateWorker(QThread):
                     SELECT *
                     INTO _RefMonster_AssignedItemRndDrop_Backup
                     FROM _RefMonster_AssignedItemRndDrop
-                    WHERE ItemGroupCodeName128 LIKE 'RARE_%'
                 """)
 
                 self.progress.emit("Backup created successfully")
@@ -1012,6 +1000,12 @@ class RareDropTool(QMainWindow):
             else:
                 self.sun_checkbox.setChecked(False)
 
+            # Try to detect level distance from existing assignments
+            level_distance = self.detect_level_distance()
+            if level_distance is not None:
+                self.level_distance_input.setText(str(level_distance))
+                config_summary.append(f"Level ±{level_distance}")
+
             # Update status label with detected configuration
             if config_summary:
                 summary_text = ", ".join(config_summary)
@@ -1030,18 +1024,63 @@ class RareDropTool(QMainWindow):
             # Just use defaults silently or show a subtle warning
             pass
 
+    def detect_level_distance(self):
+        """Detect level distance from existing RARE_* assignments."""
+        try:
+            conn = mssql_python.connect(self.get_connection_string())
+            cursor = conn.cursor()
+
+            # Get sample of RARE_* assignments with monster and item levels
+            cursor.execute("""
+                SELECT DISTINCT TOP 20
+                    a.ItemGroupCodeName128,
+                    ch.Lvl as MonsterLevel
+                FROM _RefMonster_AssignedItemRndDrop a
+                JOIN _RefObjChar ch ON a.RefMonsterID = ch.ID
+                WHERE a.ItemGroupCodeName128 LIKE 'RARE_%'
+            """)
+
+            results = cursor.fetchall()
+            conn.close()
+
+            if not results:
+                return None
+
+            # Calculate level distances from sample
+            distances = []
+            for group_name, monster_level in results:
+                # Extract level from group name: RARE_A_LVL_50 → 50
+                try:
+                    parts = group_name.split('_LVL_')
+                    if len(parts) == 2:
+                        item_level = int(parts[1])
+                        distance = abs(monster_level - item_level)
+                        distances.append(distance)
+                except (ValueError, IndexError):
+                    continue
+
+            if distances:
+                # Return the maximum distance found (this was the configured level_distance)
+                return max(distances)
+
+            return None
+
+        except Exception:
+            # If detection fails, return None to keep default
+            return None
+
     def create_backup(self):
         """Create/update backup of the drop table."""
         reply = QMessageBox.question(
             self,
             "Update Backup",
-            "This will update the backup with the current rare drop configuration.\n\n"
+            "This will update the backup with the current database state.\n\n"
             "Note: Backups are automatically created before applying changes,\n"
             "but you can manually update the backup here if needed.\n\n"
             "Backup tables:\n"
             "• _RefDropItemGroup_Backup\n"
             "• _RefMonster_AssignedItemRndDrop_Backup\n\n"
-            "Only RARE_* entries will be backed up.\n\n"
+            "⚠️  ALL rows will be backed up (not just RARE_* entries).\n\n"
             "Continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
@@ -1074,7 +1113,10 @@ class RareDropTool(QMainWindow):
         reply = QMessageBox.warning(
             self,
             "Confirm Restore",
-            "WARNING: This will DELETE all current drop entries and restore from backup!\n\n"
+            "⚠️  WARNING: This will restore the database to the backed up state!\n\n"
+            "• ALL current data in both tables will be DELETED\n"
+            "• ALL data from backup will be restored\n"
+            "• This restores the complete state from when backup was created\n\n"
             "This cannot be undone. Are you sure?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,

@@ -112,30 +112,43 @@ For each drop group at level L with level distance D:
 - When a monster drops the group, game selects one item randomly based on SelectRatio
 
 ### Automatic Backup System
-The tool automatically creates backups BEFORE applying any changes (line 286-325):
+The tool automatically creates backups BEFORE applying any changes (line 320-342):
 - **Automatic on first apply**: When "Apply Drop Rates" is clicked, checks if backup exists
 - **If no backup exists**: Creates backup tables automatically before making any changes
 - **If backup exists**: Uses existing backup (preserves original state)
-- **Manual update**: "Update Backup" button allows manually refreshing backup with current config
+- **Manual update**: "Update Backup" button allows manually refreshing backup with current database state
 
 Backup tables:
-- `_RefDropItemGroup_Backup`: Backs up rare drop group definitions
-- `_RefMonster_AssignedItemRndDrop_Backup`: Backs up rare group assignments
+- `_RefDropItemGroup_Backup`: Complete backup of all drop group definitions
+- `_RefMonster_AssignedItemRndDrop_Backup`: Complete backup of all group assignments
+
+**Important: Full table backups**:
+- **ALL rows** are backed up from both tables, not just RARE_* entries
+- First backup preserves the complete virgin database state
+- This allows complete restoration to pre-tool state
+- Subsequent manual backups can create new restore points
 
 **Safety measures**:
-- Only rare-related rows are backed up (WHERE CodeName128/ItemGroupCodeName128 LIKE 'RARE_%')
 - Backup is created BEFORE any destructive operations
 - Restore validates backup is not empty before proceeding
-- Restore deletes current rare entries and restores from both backups
+- Restore deletes ALL current data and restores complete backup (not just RARE_* rows)
+- This ensures perfect restoration to the backed up state
 
-This ensures you can always restore to the state before your first change, providing a safety net for experimentation.
+This ensures you can always restore to the complete database state before your first change, providing a safety net for experimentation.
 
 ### Auto-Configuration Loading
-On startup, the tool queries the database to detect existing rare drop configuration (line 810):
+On startup, the tool queries the database to detect existing rare drop configuration (line 856-1025):
+
+**Detection logic:**
 1. Queries `_RefMonster_AssignedItemRndDrop` for RARE_* groups
 2. Extracts drop ratios for each rare type (A, B, C)
-3. Populates UI checkboxes and probability fields with detected values
-4. Displays configuration summary in status label
+3. Detects level distance by analyzing monster-item level differences (line 1027-1070):
+   - Samples 20 RARE_* assignments
+   - Extracts item level from group name (e.g., RARE_A_LVL_50 → 50)
+   - Joins with monster levels via `_RefObjChar`
+   - Calculates max level difference (this was the original level_distance parameter)
+4. Populates UI fields: checkboxes, probability inputs, and level distance
+5. Displays configuration summary in status label (e.g., "Star: 0.01, Moon: 0.005, Sun: 0.001, Level ±10")
 
 This allows the tool to "remember" previous settings by reading them from the database, making it easier to make incremental adjustments without re-entering all values.
 
