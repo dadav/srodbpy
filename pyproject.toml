@@ -13,3 +13,6 @@ dependencies = [
 dev = [
     "pyinstaller>=6.17.0",
 ]
+
+[tool.setuptools]
+py-modules = ["main"]
