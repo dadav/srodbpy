@@ -1,0 +1,7 @@
+{
+  "server": "localhost",
+  "port": 1433,
+  "database": "SRO_VT_SHARD",
+  "user": "sa",
+  "password": "YOUR_PASSWORD_HERE"
+}

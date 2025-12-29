@@ -1,0 +1,10 @@
+[project]
+name = "srodbpy"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "PyQt6>=6.6.0",
+    "mssql-python>=1.0.0",
+]
