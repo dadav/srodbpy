@@ -32,12 +32,14 @@ jobs:
       - name: Build with PyInstaller (Windows)
         if: matrix.os == 'windows-latest'
         run: |
-          uv run pyinstaller --onefile --windowed --name sro-rare-drop-tool --hidden-import mssql_python --hidden-import PyQt6 --hidden-import PyQt6.QtCore --hidden-import PyQt6.QtWidgets --hidden-import PyQt6.QtGui main.py
+          $mssql_path = uv run python -c "import mssql_python, os; print(os.path.dirname(mssql_python.__file__))"
+          uv run pyinstaller --onefile --windowed --name sro-rare-drop-tool --hidden-import mssql_python --hidden-import PyQt6 --hidden-import PyQt6.QtCore --hidden-import PyQt6.QtWidgets --hidden-import PyQt6.QtGui --add-data "$mssql_path\libs;mssql_python\libs" --add-binary "$mssql_path\*.pyd;mssql_python" pyinstaller_entrypoint.py
 
       - name: Build with PyInstaller (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
-          uv run pyinstaller --onefile --windowed --name sro-rare-drop-tool --hidden-import mssql_python --hidden-import PyQt6 --hidden-import PyQt6.QtCore --hidden-import PyQt6.QtWidgets --hidden-import PyQt6.QtGui main.py
+          MSSQL_PATH=$(uv run python -c "import mssql_python, os; print(os.path.dirname(mssql_python.__file__))")
+          uv run pyinstaller --onefile --windowed --name sro-rare-drop-tool --hidden-import mssql_python --hidden-import PyQt6 --hidden-import PyQt6.QtCore --hidden-import PyQt6.QtWidgets --hidden-import PyQt6.QtGui --add-data "$MSSQL_PATH/libs:mssql_python/libs" --add-binary "$MSSQL_PATH/*.so:mssql_python" pyinstaller_entrypoint.py
 
       - name: Upload artifact (Windows)
         if: matrix.os == 'windows-latest'
