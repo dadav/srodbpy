@@ -345,6 +345,7 @@ class DropRateWorker(QThread):
                     SELECT ID, ReqLevel1
                     FROM _RefObjCommon
                     WHERE CodeName128 LIKE ?
+                    AND Service = 1
                     AND TypeID1 = 3
                     AND ReqLevel1 IS NOT NULL
                 """,
@@ -484,6 +485,7 @@ class DropRateWorker(QThread):
                     FROM _RefObjCommon c
                     JOIN _RefObjChar ch ON c.ID = ch.ID
                     WHERE c.CodeName128 LIKE 'MOB_%'
+                    AND c.Service = 1
                     AND ch.Lvl BETWEEN ? AND ?
                 """,
                     (min_level, max_level),
@@ -1051,7 +1053,7 @@ class RareDropTool(QMainWindow):
             for group_name, monster_level in results:
                 # Extract level from group name: RARE_A_LVL_50 → 50
                 try:
-                    parts = group_name.split('_LVL_')
+                    parts = group_name.split("_LVL_")
                     if len(parts) == 2:
                         item_level = int(parts[1])
                         distance = abs(monster_level - item_level)
