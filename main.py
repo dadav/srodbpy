@@ -2,6 +2,7 @@ import sys
 import time
 import json
 import os
+from importlib.metadata import version, PackageNotFoundError
 import mssql_python
 from PyQt6.QtWidgets import (
     QApplication,
@@ -20,6 +21,33 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
+
+
+def get_version():
+    """Read version from package metadata or pyproject.toml"""
+    # Try importlib.metadata first (works for installed packages and PyInstaller)
+    try:
+        return version("srodbpy")
+    except PackageNotFoundError:
+        pass
+
+    # Fallback: read from pyproject.toml (for development)
+    try:
+        import tomllib
+        pyproject_path = os.path.join(os.path.dirname(__file__), "pyproject.toml")
+        with open(pyproject_path, "rb") as f:
+            pyproject = tomllib.load(f)
+        return pyproject["project"]["version"]
+    except Exception as e:
+        raise RuntimeError(
+            "Could not determine version. Please ensure:\n"
+            "1. Package is installed with 'uv pip install -e .', or\n"
+            "2. pyproject.toml is accessible in the application directory.\n"
+            f"Error: {e}"
+        )
+
+
+__VERSION__ = get_version()
 
 
 class DatabaseSettingsDialog(QDialog):
@@ -233,7 +261,7 @@ class DropRateWorker(QThread):
                         SELECT c.ID
                         FROM _RefObjCommon c
                         JOIN _RefObjChar ch ON c.ID = ch.ID
-                        WHERE c.TypeID1 = 1 AND c.TypeID2 = 2
+                        WHERE c.CodeName128 LIKE 'MOB_%'
                         AND ch.Lvl BETWEEN ? AND ?
                     """,
                         (min_level, max_level),
@@ -373,7 +401,7 @@ class RareDropTool(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Rare Item Drop Probability Tool")
+        self.setWindowTitle(f"Rare Item Drop Probability Tool v{__VERSION__}")
         self.setGeometry(100, 100, 500, 400)
 
         # Load database connection parameters from config file
@@ -389,6 +417,12 @@ class RareDropTool(QMainWindow):
         title.setStyleSheet("font-size: 14pt; font-weight: bold; padding: 10px;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
+
+        # Version label
+        version_label = QLabel(f"Version {__VERSION__}")
+        version_label.setStyleSheet("font-size: 9pt; color: #666; padding-bottom: 5px;")
+        version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(version_label)
 
         # Form layout for inputs
         form_layout = QFormLayout()
@@ -461,14 +495,8 @@ class RareDropTool(QMainWindow):
         self.eta_label.setStyleSheet("padding: 5px; font-weight: bold;")
         layout.addWidget(self.eta_label)
 
-        # Button layout - main actions
+        # Button layout - utility buttons
         button_layout = QHBoxLayout()
-
-        # Apply button
-        self.apply_button = QPushButton("Apply Drop Rates")
-        self.apply_button.clicked.connect(self.apply_drop_rates)
-        self.apply_button.setStyleSheet("padding: 10px; font-size: 12pt;")
-        button_layout.addWidget(self.apply_button)
 
         # Test connection button
         self.test_button = QPushButton("Test Connection")
@@ -498,6 +526,17 @@ class RareDropTool(QMainWindow):
         backup_layout.addWidget(self.restore_button)
 
         layout.addLayout(backup_layout)
+
+        # Apply button layout - main action
+        apply_layout = QHBoxLayout()
+
+        # Apply button
+        self.apply_button = QPushButton("Apply Drop Rates")
+        self.apply_button.clicked.connect(self.apply_drop_rates)
+        self.apply_button.setStyleSheet("padding: 10px; font-size: 12pt;")
+        apply_layout.addWidget(self.apply_button)
+
+        layout.addLayout(apply_layout)
 
         # Status label
         self.status_label = QLabel("Ready")

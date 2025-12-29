@@ -155,6 +155,22 @@ _Option 2: Manual Configuration_
 
 ## Development
 
+### Versioning
+
+The project version is maintained in **one place**: `pyproject.toml`
+
+```toml
+[project]
+version = "0.1.0"
+```
+
+The application automatically reads the version from there using this priority:
+1. Package metadata (via `importlib.metadata`) - for installed packages
+2. `pyproject.toml` - for development mode
+3. **Error** - if both fail, the application will not start
+
+**Important**: Run `uv pip install -e .` after cloning to ensure version metadata is available.
+
 ### Database Schema
 
 Key tables used by these tools:
@@ -176,10 +192,10 @@ Key tables used by these tools:
 
 ### Monster Identification
 
-Monsters have:
+Monsters are identified by:
 
-- TypeID1 = 1
-- TypeID2 = 2
+- CodeName128 starting with `MOB_`
+- Example: `MOB_CH_MANGNYANG`, `MOB_CH_BIGEYEGHOST`
 
 ### Rare Item Patterns
 

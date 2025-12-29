@@ -11,3 +11,6 @@ wheels/
 
 # Configuration files (may contain passwords)
 db_config.json
+
+# pyinstaller
+*.spec

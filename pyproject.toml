@@ -1,10 +1,15 @@
 [project]
 name = "srodbpy"
 version = "0.1.0"
-description = "Add your description here"
+description = "Silkroad Online Rare Item Drop Probability Tool"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "PyQt6>=6.6.0",
     "mssql-python>=1.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.17.0",
 ]

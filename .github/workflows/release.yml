@@ -1,0 +1,105 @@
+name: Create Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies and dev tools
+        run: uv sync --group dev
+
+      - name: Install package in editable mode
+        run: uv pip install -e .
+
+      - name: Build with PyInstaller (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          uv run pyinstaller --onefile --windowed --name sro-rare-drop-tool --hidden-import mssql_python --hidden-import PyQt6 --hidden-import PyQt6.QtCore --hidden-import PyQt6.QtWidgets --hidden-import PyQt6.QtGui main.py
+
+      - name: Build with PyInstaller (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          uv run pyinstaller --onefile --windowed --name sro-rare-drop-tool --hidden-import mssql_python --hidden-import PyQt6 --hidden-import PyQt6.QtCore --hidden-import PyQt6.QtWidgets --hidden-import PyQt6.QtGui main.py
+
+      - name: Upload artifact (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sro-rare-drop-tool-windows
+          path: dist/sro-rare-drop-tool.exe
+          retention-days: 30
+
+      - name: Upload artifact (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sro-rare-drop-tool-linux
+          path: dist/sro-rare-drop-tool
+          retention-days: 30
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sro-rare-drop-tool-windows
+          path: release-artifacts
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sro-rare-drop-tool-linux
+          path: release-artifacts
+
+      - name: Extract tag name and version
+        id: tag
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          VERSION=${TAG_NAME#v}
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Rename Windows artifact
+        run: |
+          mv release-artifacts/sro-rare-drop-tool.exe "release-artifacts/sro-rare-drop-tool-v${{ steps.tag.outputs.VERSION }}-windows.exe"
+
+      - name: Rename Linux artifact
+        run: |
+          mv release-artifacts/sro-rare-drop-tool "release-artifacts/sro-rare-drop-tool-v${{ steps.tag.outputs.VERSION }}-linux"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.tag.outputs.TAG_NAME }}
+          name: Release ${{ steps.tag.outputs.TAG_NAME }}
+          files: |
+            release-artifacts/sro-rare-drop-tool-v${{ steps.tag.outputs.VERSION }}-windows.exe
+            release-artifacts/sro-rare-drop-tool-v${{ steps.tag.outputs.VERSION }}-linux
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
