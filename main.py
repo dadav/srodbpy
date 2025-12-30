@@ -276,12 +276,23 @@ class DropRateWorker(QThread):
     progress_percent = pyqtSignal(int, str)  # percentage, ETA
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, db_config, rare_types, probabilities, level_distance):
+    def __init__(self, db_config, rare_types, probabilities, level_distance, country_mixture):
         super().__init__()
         self.db_config = db_config
         self.rare_types = rare_types  # List of ('A', 'B', 'C') for enabled types
         self.probabilities = probabilities  # Dict: {'A': 0.01, 'B': 0.02, 'C': 0.03}
         self.level_distance = level_distance
+        self.country_mixture = country_mixture  # Bool: True = allow cross-region, False = same region only
+
+    @staticmethod
+    def get_region(country):
+        """Map country code to region. Country 0 and 3 = Chinese, Country 1 = Europe."""
+        if country in (0, 3):
+            return "CN"  # Chinese
+        elif country == 1:
+            return "EU"  # Europe
+        else:
+            return f"R{country}"  # Other regions use R prefix
 
     def run(self):
         """Execute the drop rate update using group-based approach."""
@@ -331,18 +342,21 @@ class DropRateWorker(QThread):
 
                 self.progress.emit("Backup created successfully")
 
-            # Step 1: Collect items and organize by (rare_type, level)
-            self.progress.emit("Step 1/6: Collecting items and organizing by level...")
+            # Step 1: Collect items and organize by (rare_type, level) or (rare_type, level, region)
+            if self.country_mixture:
+                self.progress.emit("Step 1/6: Collecting items and organizing by level (region mixture enabled)...")
+            else:
+                self.progress.emit("Step 1/6: Collecting items and organizing by level and region...")
             self.progress_percent.emit(5, "Analyzing...")
 
-            # Dictionary: {(rare_type, level): [item_ids]}
+            # Dictionary: {(rare_type, level) or (rare_type, level, region): [item_ids]}
             items_by_type_level = {}
             item_count = 0
 
             for rare_type in self.rare_types:
                 cursor.execute(
                     """
-                    SELECT ID, ReqLevel1
+                    SELECT ID, ReqLevel1, Country
                     FROM _RefObjCommon
                     WHERE CodeName128 LIKE ?
                     AND Service = 1
@@ -353,9 +367,15 @@ class DropRateWorker(QThread):
                 )
                 items = cursor.fetchall()
 
-                for item_id, item_level in items:
+                for item_id, item_level, country in items:
                     item_count += 1
-                    key = (rare_type, item_level)
+                    # Organize by region if country_mixture is disabled
+                    if self.country_mixture:
+                        key = (rare_type, item_level)
+                    else:
+                        region = self.get_region(country)
+                        key = (rare_type, item_level, region)
+
                     if key not in items_by_type_level:
                         items_by_type_level[key] = []
                     items_by_type_level[key].append(item_id)
@@ -385,14 +405,22 @@ class DropRateWorker(QThread):
             max_group_id = cursor.fetchone()[0] or 0
             next_group_id = max_group_id + 1
 
-            # Track created groups: {(rare_type, level): group_id}
+            # Track created groups: {key: group_id} where key is (rare_type, level) or (rare_type, level, region)
             created_groups = {}
             group_entries = []  # [(Service, RefItemGroupID, CodeName128, RefItemID, SelectRatio, RefMagicGroupID)]
 
-            for (rare_type, level), item_ids in items_by_type_level.items():
+            for key, item_ids in items_by_type_level.items():
                 group_id = next_group_id
-                group_name = f"RARE_{rare_type}_LVL_{level}"
-                created_groups[(rare_type, level)] = group_id
+
+                # Create group name based on whether country_mixture is enabled
+                if self.country_mixture:
+                    rare_type, level = key
+                    group_name = f"RARE_{rare_type}_LVL_{level}"
+                else:
+                    rare_type, level, region = key
+                    group_name = f"RARE_{rare_type}_LVL_{level}_{region}"
+
+                created_groups[key] = group_id
                 next_group_id += 1
 
                 # Calculate equal SelectRatio for all items in group
@@ -471,25 +499,85 @@ class DropRateWorker(QThread):
 
             assignments = []  # [(Service, RefMonsterID, RefItemGroupID, ItemGroupCodeName128, Overlap, DropAmountMin, DropAmountMax, DropRatio, param1, param2)]
 
-            for (rare_type, level), group_id in created_groups.items():
-                group_name = f"RARE_{rare_type}_LVL_{level}"
+            for key, group_id in created_groups.items():
+                # Extract rare_type, level, and optionally region from key
+                if self.country_mixture:
+                    rare_type, level = key
+                    group_name = f"RARE_{rare_type}_LVL_{level}"
+                    region_filter = None
+                else:
+                    rare_type, level, region = key
+                    group_name = f"RARE_{rare_type}_LVL_{level}_{region}"
+                    region_filter = region
+
                 drop_ratio = self.probabilities[rare_type]
 
                 min_level = max(0, level - self.level_distance)
                 max_level = level + self.level_distance
 
-                # Find monsters within level range
-                cursor.execute(
-                    """
-                    SELECT c.ID
-                    FROM _RefObjCommon c
-                    JOIN _RefObjChar ch ON c.ID = ch.ID
-                    WHERE c.CodeName128 LIKE 'MOB_%'
-                    AND c.Service = 1
-                    AND ch.Lvl BETWEEN ? AND ?
-                """,
-                    (min_level, max_level),
-                )
+                # Find monsters within level range, optionally filtered by region
+                if self.country_mixture:
+                    # No region filtering - all monsters in level range
+                    cursor.execute(
+                        """
+                        SELECT c.ID
+                        FROM _RefObjCommon c
+                        JOIN _RefObjChar ch ON c.Link = ch.ID
+                        WHERE c.CodeName128 LIKE 'MOB_%'
+                        AND c.TypeID1 = 1
+                        AND c.Service = 1
+                        AND ch.Lvl BETWEEN ? AND ?
+                    """,
+                        (min_level, max_level),
+                    )
+                else:
+                    # Filter by region - match monsters from same region
+                    if region_filter == "CN":
+                        # Chinese region: country 0 or 3
+                        cursor.execute(
+                            """
+                            SELECT c.ID
+                            FROM _RefObjCommon c
+                            JOIN _RefObjChar ch ON c.Link = ch.ID
+                            WHERE c.CodeName128 LIKE 'MOB_%'
+                            AND c.TypeID1 = 1
+                            AND c.Service = 1
+                            AND c.Country IN (0, 3)
+                            AND ch.Lvl BETWEEN ? AND ?
+                        """,
+                            (min_level, max_level),
+                        )
+                    elif region_filter == "EU":
+                        # European region: country 1
+                        cursor.execute(
+                            """
+                            SELECT c.ID
+                            FROM _RefObjCommon c
+                            JOIN _RefObjChar ch ON c.Link = ch.ID
+                            WHERE c.CodeName128 LIKE 'MOB_%'
+                            AND c.TypeID1 = 1
+                            AND c.Service = 1
+                            AND c.Country = 1
+                            AND ch.Lvl BETWEEN ? AND ?
+                        """,
+                            (min_level, max_level),
+                        )
+                    else:
+                        # Other regions: extract country code from region name (e.g., R2 -> 2)
+                        country_code = int(region_filter[1:])
+                        cursor.execute(
+                            """
+                            SELECT c.ID
+                            FROM _RefObjCommon c
+                            JOIN _RefObjChar ch ON c.Link = ch.ID
+                            WHERE c.CodeName128 LIKE 'MOB_%'
+                            AND c.TypeID1 = 1
+                            AND c.Service = 1
+                            AND c.Country = ?
+                            AND ch.Lvl BETWEEN ? AND ?
+                        """,
+                            (country_code, min_level, max_level),
+                        )
 
                 monsters = cursor.fetchall()
                 for (monster_id,) in monsters:
@@ -614,8 +702,8 @@ class RareDropTool(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"Rare Item Drop Probability Tool v{__VERSION__}")
-        self.setGeometry(100, 100, 500, 550)
-        self.setMinimumSize(500, 550)  # Prevent window from being too small
+        self.setGeometry(100, 100, 500, 600)
+        self.setMinimumSize(500, 600)  # Prevent window from being too small
 
         # Load database connection parameters from config file
         self.load_config()
@@ -682,12 +770,28 @@ class RareDropTool(QMainWindow):
         self.level_distance_input.setFixedWidth(150)
         form_layout.addRow("Level Distance (±):", self.level_distance_input)
 
+        # Region mixture
+        region_layout = QHBoxLayout()
+        self.country_mixture_checkbox = QCheckBox("Allow cross-region drops")
+        self.country_mixture_checkbox.setChecked(True)
+        self.country_mixture_checkbox.setToolTip(
+            "When enabled, monsters can drop items from any region.\n"
+            "When disabled, monsters only drop items from the same region.\n"
+            "Regions: Chinese (countries 0, 3), European (country 1)"
+        )
+        region_layout.addWidget(self.country_mixture_checkbox)
+        region_layout.addStretch()
+        form_layout.addRow("Region Mixture:", region_layout)
+
         layout.addLayout(form_layout)
 
         # Info label
         info_label = QLabel(
             "Items will be assigned to monsters within ± the level distance.\n"
-            "Example: A level 100 item with distance 10 drops from level 90-110 monsters."
+            "Example: A level 100 item with distance 10 drops from level 90-110 monsters.\n\n"
+            "Region mixture: When enabled, monsters can drop items from any region.\n"
+            "When disabled, Chinese monsters (countries 0, 3) drop Chinese items,\n"
+            "and European monsters (country 1) drop European items."
         )
         info_label.setStyleSheet(
             "padding: 10px; background-color: #e7f3ff; border-radius: 5px;"
@@ -956,15 +1060,28 @@ class RareDropTool(QMainWindow):
 
             # Parse results to extract drop ratios by rare type
             rare_configs = {"A": set(), "B": set(), "C": set()}
+            has_region_code = False
 
             for group_name, drop_ratio in results:
-                # Group names are like: RARE_A_LVL_50, RARE_B_LVL_30, etc.
+                # Group names are like: RARE_A_LVL_50, or RARE_A_LVL_50_CN, RARE_A_LVL_50_EU, RARE_A_LVL_50_R2, etc.
+                # Check if any group name contains region code (e.g., _CN, _EU, _R2)
+                parts = group_name.split("_")
+                if len(parts) > 4:  # RARE_A_LVL_50 has 4 parts, with region it has 5+
+                    last_part = parts[-1]
+                    # Check for CN, EU, or R<digit> patterns
+                    if last_part in ("CN", "EU") or (last_part.startswith("R") and last_part[1:].isdigit()):
+                        has_region_code = True
+
                 if "RARE_A_" in group_name:
                     rare_configs["A"].add(drop_ratio)
                 elif "RARE_B_" in group_name:
                     rare_configs["B"].add(drop_ratio)
                 elif "RARE_C_" in group_name:
                     rare_configs["C"].add(drop_ratio)
+
+            # Update country mixture checkbox based on detection
+            # If groups have region codes, country mixture is disabled
+            self.country_mixture_checkbox.setChecked(not has_region_code)
 
             # Update UI with detected values
             config_summary = []
@@ -1008,6 +1125,12 @@ class RareDropTool(QMainWindow):
                 self.level_distance_input.setText(str(level_distance))
                 config_summary.append(f"Level ±{level_distance}")
 
+            # Add region mixture status to summary
+            if has_region_code:
+                config_summary.append("Region-aware")
+            else:
+                config_summary.append("Region mixture")
+
             # Update status label with detected configuration
             if config_summary:
                 summary_text = ", ".join(config_summary)
@@ -1032,14 +1155,18 @@ class RareDropTool(QMainWindow):
             conn = mssql_python.connect(self.get_connection_string())
             cursor = conn.cursor()
 
-            # Get sample of RARE_* assignments with monster and item levels
+            # For each unique group, get the min and max monster levels assigned to it
+            # This will accurately reflect the configured level_distance parameter
             cursor.execute("""
-                SELECT DISTINCT TOP 20
+                SELECT
                     a.ItemGroupCodeName128,
-                    ch.Lvl as MonsterLevel
+                    MIN(ch.Lvl) as MinMonsterLevel,
+                    MAX(ch.Lvl) as MaxMonsterLevel
                 FROM _RefMonster_AssignedItemRndDrop a
-                JOIN _RefObjChar ch ON a.RefMonsterID = ch.ID
+                JOIN _RefObjCommon c ON a.RefMonsterID = c.ID
+                JOIN _RefObjChar ch ON c.Link = ch.ID
                 WHERE a.ItemGroupCodeName128 LIKE 'RARE_%'
+                GROUP BY a.ItemGroupCodeName128
             """)
 
             results = cursor.fetchall()
@@ -1048,22 +1175,38 @@ class RareDropTool(QMainWindow):
             if not results:
                 return None
 
-            # Calculate level distances from sample
+            # Calculate distance based on monster level range for each group
+            # Filter out edge cases (very low or very high level items)
             distances = []
-            for group_name, monster_level in results:
-                # Extract level from group name: RARE_A_LVL_50 → 50
+            for group_name, min_monster_level, max_monster_level in results:
+                # Extract level from group name: RARE_A_LVL_50 → 50 or RARE_A_LVL_50_CN → 50
                 try:
+                    # Split by _LVL_ and then take everything before the next underscore or region code
                     parts = group_name.split("_LVL_")
-                    if len(parts) == 2:
-                        item_level = int(parts[1])
-                        distance = abs(monster_level - item_level)
-                        distances.append(distance)
+                    if len(parts) >= 2:
+                        # Handle both RARE_A_LVL_50 and RARE_A_LVL_50_CN formats
+                        level_part = parts[1].split("_")[0]  # Takes "50" from "50" or "50_CN"
+                        item_level = int(level_part)
+
+                        # Filter out edge cases (items at extreme levels where monster coverage is incomplete)
+                        # Focus on items in the middle range (20-110) for accurate detection
+                        if 20 <= item_level <= 110:
+                            # Calculate distance from item level to furthest assigned monster
+                            # This correctly handles asymmetric ranges (e.g., when max(0, level-D) is used)
+                            distance_from_min = abs(item_level - min_monster_level)
+                            distance_from_max = abs(item_level - max_monster_level)
+                            estimated_distance = max(distance_from_min, distance_from_max)
+                            distances.append(estimated_distance)
                 except (ValueError, IndexError):
                     continue
 
             if distances:
-                # Return the maximum distance found (this was the configured level_distance)
-                return max(distances)
+                # Use mode (most common distance) to get the configured value
+                from collections import Counter
+                distance_counts = Counter(distances)
+                most_common_distance = distance_counts.most_common(1)[0][0]
+
+                return most_common_distance if most_common_distance > 0 else None
 
             return None
 
@@ -1244,11 +1387,15 @@ class RareDropTool(QMainWindow):
 
         # Confirm action
         types_str = ", ".join([f"{t}_RARE" for t in rare_types])
+        country_mixture = self.country_mixture_checkbox.isChecked()
+        region_mode = "Cross-region drops enabled" if country_mixture else "Region-aware (Chinese/European separation)"
+
         reply = QMessageBox.question(
             self,
             "Confirm Action",
             f"This will update drop rates for:\n{types_str}\n\n"
-            f"Level distance: ±{level_distance}\n\n"
+            f"Level distance: ±{level_distance}\n"
+            f"Region mode: {region_mode}\n\n"
             f"⚠️  This operation will DELETE existing drop entries for these items.\n\n"
             f"✓  A backup will be created automatically before applying changes.\n"
             f"✓  You can restore from backup at any time.\n\n"
@@ -1274,8 +1421,9 @@ class RareDropTool(QMainWindow):
         )
 
         # Start worker thread
+        country_mixture = self.country_mixture_checkbox.isChecked()
         self.worker = DropRateWorker(
-            self.get_connection_string(), rare_types, probabilities, level_distance
+            self.get_connection_string(), rare_types, probabilities, level_distance, country_mixture
         )
         self.worker.progress.connect(self.on_progress)
         self.worker.progress_percent.connect(self.on_progress_percent)
