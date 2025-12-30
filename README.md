@@ -1,5 +1,7 @@
 # Silkroad Online Database Tools
 
+![UI](ui.png)
+
 A GUI tool for managing the Silkroad Online database, specifically for configuring rare item drop rates.
 
 ## Rare Item Drop Probability Tool
@@ -165,6 +167,7 @@ version = "0.1.0"
 ```
 
 The application automatically reads the version from there using this priority:
+
 1. Package metadata (via `importlib.metadata`) - for installed packages
 2. `pyproject.toml` - for development mode
 3. **Error** - if both fail, the application will not start
