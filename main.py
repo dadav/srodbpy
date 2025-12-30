@@ -19,6 +19,8 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QDialog,
     QDialogButtonBox,
+    QTextEdit,
+    QScrollArea,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
@@ -276,13 +278,15 @@ class DropRateWorker(QThread):
     progress_percent = pyqtSignal(int, str)  # percentage, ETA
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, db_config, rare_types, probabilities, level_distance, country_mixture):
+    def __init__(self, db_config, rare_types, probabilities, level_distance, country_mixture, level_threshold, decrease_pct):
         super().__init__()
         self.db_config = db_config
         self.rare_types = rare_types  # List of ('A', 'B', 'C') for enabled types
         self.probabilities = probabilities  # Dict: {'A': 0.01, 'B': 0.02, 'C': 0.03}
         self.level_distance = level_distance
         self.country_mixture = country_mixture  # Bool: True = allow cross-region, False = same region only
+        self.level_threshold = level_threshold  # Monster level threshold - monsters at or below get full probability
+        self.decrease_pct = decrease_pct  # Percentage decrease per level above threshold
 
     @staticmethod
     def get_region(country):
@@ -520,7 +524,7 @@ class DropRateWorker(QThread):
                     # No region filtering - all monsters in level range
                     cursor.execute(
                         """
-                        SELECT c.ID
+                        SELECT c.ID, ch.Lvl
                         FROM _RefObjCommon c
                         JOIN _RefObjChar ch ON c.Link = ch.ID
                         WHERE c.CodeName128 LIKE 'MOB_%'
@@ -536,7 +540,7 @@ class DropRateWorker(QThread):
                         # Chinese region: country 0 or 3
                         cursor.execute(
                             """
-                            SELECT c.ID
+                            SELECT c.ID, ch.Lvl
                             FROM _RefObjCommon c
                             JOIN _RefObjChar ch ON c.Link = ch.ID
                             WHERE c.CodeName128 LIKE 'MOB_%'
@@ -551,7 +555,7 @@ class DropRateWorker(QThread):
                         # European region: country 1
                         cursor.execute(
                             """
-                            SELECT c.ID
+                            SELECT c.ID, ch.Lvl
                             FROM _RefObjCommon c
                             JOIN _RefObjChar ch ON c.Link = ch.ID
                             WHERE c.CodeName128 LIKE 'MOB_%'
@@ -567,7 +571,7 @@ class DropRateWorker(QThread):
                         country_code = int(region_filter[1:])
                         cursor.execute(
                             """
-                            SELECT c.ID
+                            SELECT c.ID, ch.Lvl
                             FROM _RefObjCommon c
                             JOIN _RefObjChar ch ON c.Link = ch.ID
                             WHERE c.CodeName128 LIKE 'MOB_%'
@@ -580,9 +584,23 @@ class DropRateWorker(QThread):
                         )
 
                 monsters = cursor.fetchall()
-                for (monster_id,) in monsters:
+                for monster_id, monster_level in monsters:
+                    # Calculate adjusted drop ratio based on level threshold
+                    if self.level_threshold > 0 and self.decrease_pct > 0 and monster_level > self.level_threshold:
+                        # Monster is above threshold, apply decreasing probability
+                        levels_above_threshold = monster_level - self.level_threshold
+                        decrease_factor = (1 - self.decrease_pct / 100) ** levels_above_threshold
+                        adjusted_drop_ratio = drop_ratio * decrease_factor
+
+                        # Add minimum floor to prevent extremely tiny values
+                        # Never go below 1% of base rate
+                        adjusted_drop_ratio = max(adjusted_drop_ratio, drop_ratio * 0.01)
+                    else:
+                        # Monster at or below threshold, or feature disabled
+                        adjusted_drop_ratio = drop_ratio
+
                     assignments.append(
-                        (1, monster_id, group_id, group_name, 0, 1, 1, drop_ratio, 0, 0)
+                        (1, monster_id, group_id, group_name, 0, 1, 1, adjusted_drop_ratio, 0, 0)
                     )
 
                 if len(created_groups) % 10 == 0:
@@ -702,8 +720,8 @@ class RareDropTool(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"Rare Item Drop Probability Tool v{__VERSION__}")
-        self.setGeometry(100, 100, 500, 600)
-        self.setMinimumSize(500, 600)  # Prevent window from being too small
+        self.setGeometry(100, 100, 600, 720)
+        self.setMinimumSize(600, 720)  # Prevent window from being too small
 
         # Load database connection parameters from config file
         self.load_config()
@@ -727,61 +745,151 @@ class RareDropTool(QMainWindow):
 
         # Form layout for inputs
         form_layout = QFormLayout()
+        form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        form_layout.setVerticalSpacing(18)
+        form_layout.setHorizontalSpacing(15)
+        form_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        # Increase label font size
+        label_style = "font-size: 11pt;"
 
         # Star (A_RARE)
+        star_label = QLabel("Seal of Star:")
+        star_label.setStyleSheet(label_style)
         star_layout = QHBoxLayout()
+        star_layout.setSpacing(10)
+        star_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.star_checkbox = QCheckBox("Enable")
         self.star_checkbox.setChecked(True)
+        self.star_checkbox.setStyleSheet("font-size: 11pt;")
+        self.star_checkbox.setFixedWidth(80)
         self.star_prob_input = QLineEdit("0.01")
         self.star_prob_input.setPlaceholderText("0.01 for 1%")
-        self.star_prob_input.setFixedWidth(150)
-        star_layout.addWidget(self.star_checkbox)
-        star_layout.addWidget(self.star_prob_input)
+        self.star_prob_input.setMinimumHeight(35)
+        self.star_prob_input.setFixedWidth(200)
+        self.star_prob_input.setStyleSheet("font-size: 12pt; padding: 5px;")
+        star_layout.addWidget(self.star_checkbox, 0, Qt.AlignmentFlag.AlignVCenter)
+        star_layout.addWidget(self.star_prob_input, 0, Qt.AlignmentFlag.AlignVCenter)
         star_layout.addStretch()
-        form_layout.addRow("Seal of Star:", star_layout)
+        form_layout.addRow(star_label, star_layout)
 
         # Moon (B_RARE)
+        moon_label = QLabel("Seal of Moon:")
+        moon_label.setStyleSheet(label_style)
         moon_layout = QHBoxLayout()
+        moon_layout.setSpacing(10)
+        moon_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.moon_checkbox = QCheckBox("Enable")
         self.moon_checkbox.setChecked(True)
+        self.moon_checkbox.setStyleSheet("font-size: 11pt;")
+        self.moon_checkbox.setFixedWidth(80)
         self.moon_prob_input = QLineEdit("0.005")
         self.moon_prob_input.setPlaceholderText("0.01 for 1%")
-        self.moon_prob_input.setFixedWidth(150)
-        moon_layout.addWidget(self.moon_checkbox)
-        moon_layout.addWidget(self.moon_prob_input)
+        self.moon_prob_input.setMinimumHeight(35)
+        self.moon_prob_input.setFixedWidth(200)
+        self.moon_prob_input.setStyleSheet("font-size: 12pt; padding: 5px;")
+        moon_layout.addWidget(self.moon_checkbox, 0, Qt.AlignmentFlag.AlignVCenter)
+        moon_layout.addWidget(self.moon_prob_input, 0, Qt.AlignmentFlag.AlignVCenter)
         moon_layout.addStretch()
-        form_layout.addRow("Seal of Moon:", moon_layout)
+        form_layout.addRow(moon_label, moon_layout)
 
         # Sun (C_RARE)
+        sun_label = QLabel("Seal of Sun:")
+        sun_label.setStyleSheet(label_style)
         sun_layout = QHBoxLayout()
+        sun_layout.setSpacing(10)
+        sun_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.sun_checkbox = QCheckBox("Enable")
         self.sun_checkbox.setChecked(True)
+        self.sun_checkbox.setStyleSheet("font-size: 11pt;")
+        self.sun_checkbox.setFixedWidth(80)
         self.sun_prob_input = QLineEdit("0.001")
         self.sun_prob_input.setPlaceholderText("0.01 for 1%")
-        self.sun_prob_input.setFixedWidth(150)
-        sun_layout.addWidget(self.sun_checkbox)
-        sun_layout.addWidget(self.sun_prob_input)
+        self.sun_prob_input.setMinimumHeight(35)
+        self.sun_prob_input.setFixedWidth(200)
+        self.sun_prob_input.setStyleSheet("font-size: 12pt; padding: 5px;")
+        sun_layout.addWidget(self.sun_checkbox, 0, Qt.AlignmentFlag.AlignVCenter)
+        sun_layout.addWidget(self.sun_prob_input, 0, Qt.AlignmentFlag.AlignVCenter)
         sun_layout.addStretch()
-        form_layout.addRow("Seal of Sun:", sun_layout)
+        form_layout.addRow(sun_label, sun_layout)
 
         # Level distance
+        distance_label = QLabel("Level Distance (±):")
+        distance_label.setStyleSheet(label_style)
         self.level_distance_input = QLineEdit("10")
         self.level_distance_input.setPlaceholderText("e.g., 10")
-        self.level_distance_input.setFixedWidth(150)
-        form_layout.addRow("Level Distance (±):", self.level_distance_input)
+        self.level_distance_input.setMinimumHeight(35)
+        self.level_distance_input.setFixedWidth(200)
+        self.level_distance_input.setStyleSheet("font-size: 12pt; padding: 5px;")
+        form_layout.addRow(distance_label, self.level_distance_input)
+
+        # Level threshold for decreasing probability
+        threshold_label = QLabel("Level Threshold:")
+        threshold_label.setStyleSheet(label_style)
+        self.level_threshold_input = QLineEdit(self.saved_level_threshold)
+        self.level_threshold_input.setPlaceholderText("e.g., 100")
+        self.level_threshold_input.setMinimumHeight(35)
+        self.level_threshold_input.setFixedWidth(200)
+        self.level_threshold_input.setStyleSheet("font-size: 12pt; padding: 5px;")
+        threshold_tooltip = (
+            "Monster level threshold for probability decrease.\n"
+            "Monsters at or below this level get full base probability.\n"
+            "Monsters above this level get decreasing probability.\n"
+            "\n"
+            "Set to 0 to disable (all monsters get base rate)."
+        )
+        self.level_threshold_input.setToolTip(threshold_tooltip)
+        form_layout.addRow(threshold_label, self.level_threshold_input)
+
+        # Decrease per level with Show Probabilities button
+        decrease_label = QLabel("Decrease per Level (%):")
+        decrease_label.setStyleSheet(label_style)
+        decrease_layout = QHBoxLayout()
+        decrease_layout.setSpacing(10)
+        decrease_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.decrease_input = QLineEdit(self.saved_decrease_pct)
+        self.decrease_input.setPlaceholderText("0-100")
+        self.decrease_input.setMinimumHeight(35)
+        self.decrease_input.setFixedWidth(200)
+        self.decrease_input.setStyleSheet("font-size: 12pt; padding: 5px;")
+        decrease_tooltip = (
+            "Compound percentage decrease per level above threshold.\n"
+            "Examples with threshold=100, decrease=10%:\n"
+            "  Level 100 (at threshold): 100% of base rate\n"
+            "  Level 101 (1 above): 90% of base rate\n"
+            "  Level 105 (5 above): 59% of base rate\n"
+            "  Level 110 (10 above): 35% of base rate\n"
+            "\n"
+            "Set to 0 to disable (all monsters get same rate)."
+        )
+        self.decrease_input.setToolTip(decrease_tooltip)
+        decrease_layout.addWidget(self.decrease_input, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self.show_prob_button = QPushButton("Show Probabilities")
+        self.show_prob_button.setMinimumHeight(35)
+        self.show_prob_button.setStyleSheet("font-size: 11pt; padding: 5px;")
+        self.show_prob_button.clicked.connect(self.show_probability_dialog)
+        decrease_layout.addWidget(self.show_prob_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        decrease_layout.addStretch()
+        form_layout.addRow(decrease_label, decrease_layout)
 
         # Region mixture
+        region_label = QLabel("Region Mixture:")
+        region_label.setStyleSheet(label_style)
         region_layout = QHBoxLayout()
+        region_layout.setSpacing(10)
+        region_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.country_mixture_checkbox = QCheckBox("Allow cross-region drops")
         self.country_mixture_checkbox.setChecked(True)
+        self.country_mixture_checkbox.setStyleSheet("font-size: 11pt;")
+        self.country_mixture_checkbox.setMinimumHeight(35)
         self.country_mixture_checkbox.setToolTip(
             "When enabled, monsters can drop items from any region.\n"
             "When disabled, monsters only drop items from the same region.\n"
             "Regions: Chinese (countries 0, 3), European (country 1)"
         )
-        region_layout.addWidget(self.country_mixture_checkbox)
+        region_layout.addWidget(self.country_mixture_checkbox, 0, Qt.AlignmentFlag.AlignVCenter)
         region_layout.addStretch()
-        form_layout.addRow("Region Mixture:", region_layout)
+        form_layout.addRow(region_label, region_layout)
 
         layout.addLayout(form_layout)
 
@@ -887,6 +995,8 @@ class RareDropTool(QMainWindow):
             "database": "SRO_VT_SHARD",
             "user": "sa",
             "password": "",
+            "level_threshold": "0",
+            "decrease_pct": "0",
         }
 
         if os.path.exists(self.CONFIG_FILE):
@@ -898,6 +1008,8 @@ class RareDropTool(QMainWindow):
                 self.database = config.get("database", default_config["database"])
                 self.user = config.get("user", default_config["user"])
                 self.password = config.get("password", default_config["password"])
+                self.saved_level_threshold = config.get("level_threshold", default_config["level_threshold"])
+                self.saved_decrease_pct = config.get("decrease_pct", default_config["decrease_pct"])
             except Exception:
                 # If config file is corrupted, use defaults
                 self.server = default_config["server"]
@@ -905,6 +1017,8 @@ class RareDropTool(QMainWindow):
                 self.database = default_config["database"]
                 self.user = default_config["user"]
                 self.password = default_config["password"]
+                self.saved_level_threshold = default_config["level_threshold"]
+                self.saved_decrease_pct = default_config["decrease_pct"]
         else:
             # Use defaults
             self.server = default_config["server"]
@@ -912,6 +1026,8 @@ class RareDropTool(QMainWindow):
             self.database = default_config["database"]
             self.user = default_config["user"]
             self.password = default_config["password"]
+            self.saved_level_threshold = default_config["level_threshold"]
+            self.saved_decrease_pct = default_config["decrease_pct"]
 
     def save_config(self):
         """Save database configuration to file."""
@@ -921,6 +1037,8 @@ class RareDropTool(QMainWindow):
             "database": self.database,
             "user": self.user,
             "password": self.password,
+            "level_threshold": self.level_threshold_input.text() if hasattr(self, 'level_threshold_input') else "0",
+            "decrease_pct": self.decrease_input.text() if hasattr(self, 'decrease_input') else "0",
         }
         try:
             with open(self.CONFIG_FILE, "w") as f:
@@ -955,6 +1073,162 @@ class RareDropTool(QMainWindow):
                 "Settings Saved",
                 "Database connection settings have been saved.\n\n"
                 "Click 'Test Connection' to verify the new settings.",
+            )
+
+    def show_probability_dialog(self):
+        """Show probability calculations in a dialog window."""
+        try:
+            threshold = int(self.level_threshold_input.text().strip() or "0")
+            decrease = float(self.decrease_input.text().strip() or "0")
+
+            # Get base probabilities for enabled rare types
+            rare_probabilities = {}
+            rare_names = {}
+
+            if self.star_checkbox.isChecked():
+                try:
+                    rare_probabilities['Star'] = float(self.star_prob_input.text().strip() or "0")
+                    rare_names['Star'] = 'Seal of Star'
+                except ValueError:
+                    pass
+
+            if self.moon_checkbox.isChecked():
+                try:
+                    rare_probabilities['Moon'] = float(self.moon_prob_input.text().strip() or "0")
+                    rare_names['Moon'] = 'Seal of Moon'
+                except ValueError:
+                    pass
+
+            if self.sun_checkbox.isChecked():
+                try:
+                    rare_probabilities['Sun'] = float(self.sun_prob_input.text().strip() or "0")
+                    rare_names['Sun'] = 'Seal of Sun'
+                except ValueError:
+                    pass
+
+            if not rare_probabilities:
+                QMessageBox.information(
+                    self,
+                    "No Rare Types Enabled",
+                    "Please enable at least one rare type to see probability calculations."
+                )
+                return
+
+            # Create dialog
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Drop Probability Calculations")
+            dialog.setMinimumSize(800, 600)
+            layout = QVBoxLayout(dialog)
+            layout.setSpacing(15)
+            layout.setContentsMargins(20, 20, 20, 20)
+
+            # Add title
+            title_label = QLabel("Drop Probability by Monster Level")
+            title_label.setStyleSheet("font-size: 16pt; font-weight: bold; color: #2c3e50; padding: 10px;")
+            layout.addWidget(title_label)
+
+            # Create text display for probability table
+            prob_text = QTextEdit()
+            prob_text.setReadOnly(True)
+            prob_text.setStyleSheet("""
+                QTextEdit {
+                    font-family: 'Courier New', Courier, monospace;
+                    font-size: 11pt;
+                    background-color: #f8f9fa;
+                    border: 2px solid #dee2e6;
+                    border-radius: 8px;
+                    padding: 15px;
+                    color: #212529;
+                }
+            """)
+
+            if threshold <= 0 or decrease <= 0:
+                # Show base rates when disabled
+                lines = ["Probability Decrease: DISABLED\n"]
+                lines.append("Monster Level  | " + " | ".join([f"{rare_names[r]:19s}" for r in sorted(rare_probabilities.keys())]))
+                lines.append("=" * (15 + len(rare_probabilities) * 24))
+
+                # Show levels from 10 to 140 in steps of 10
+                example_levels = list(range(10, 150, 10))
+                for level in example_levels:
+                    probs = []
+                    for rare_type in sorted(rare_probabilities.keys()):
+                        base_prob = rare_probabilities[rare_type]
+                        probs.append(f"{base_prob:.6f} ({base_prob*100:.4f}%)")
+                    lines.append(f"Level {level:3d}     | " + " | ".join(probs))
+
+                prob_text.setPlainText("\n".join(lines))
+            else:
+                # Calculate examples in steps of 10 levels up to 140
+                levels = list(range(threshold, 150, 10))
+                if threshold not in levels:
+                    levels = [threshold] + levels
+
+                lines = [f"Probability Decrease: ENABLED (Threshold: {threshold}, Decrease: {decrease}% per level)\n"]
+                lines.append("Monster Level  | " + " | ".join([f"{rare_names[r]:19s}" for r in sorted(rare_probabilities.keys())]))
+                lines.append("=" * (15 + len(rare_probabilities) * 24))
+
+                for level in levels:
+                    if level > threshold:
+                        levels_above = level - threshold
+                        decrease_factor = (1 - decrease / 100) ** levels_above
+                    else:
+                        decrease_factor = 1.0
+
+                    probs = []
+                    for rare_type in sorted(rare_probabilities.keys()):
+                        base_prob = rare_probabilities[rare_type]
+                        actual_prob = base_prob * decrease_factor
+                        # Ensure minimum floor of 1% of base
+                        actual_prob = max(actual_prob, base_prob * 0.01)
+                        probs.append(f"{actual_prob:.6f} ({actual_prob*100:.4f}%)")
+
+                    level_label = f"Level {level:3d}"
+                    if level > threshold:
+                        level_label += f" (+{levels_above:2d})"
+                    else:
+                        level_label += "     "
+
+                    lines.append(level_label + " | " + " | ".join(probs))
+
+                prob_text.setPlainText("\n".join(lines))
+
+            layout.addWidget(prob_text)
+
+            # Add info footer
+            info_label = QLabel("Note: Probabilities shown are actual drop rates that will be applied to the database.")
+            info_label.setStyleSheet("color: #6c757d; font-size: 9pt; font-style: italic; padding: 5px;")
+            layout.addWidget(info_label)
+
+            # Add close button
+            button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+            button_box.setStyleSheet("""
+                QPushButton {
+                    background-color: #007bff;
+                    color: white;
+                    border: none;
+                    padding: 8px 20px;
+                    border-radius: 4px;
+                    font-size: 10pt;
+                    min-width: 80px;
+                }
+                QPushButton:hover {
+                    background-color: #0056b3;
+                }
+                QPushButton:pressed {
+                    background-color: #004085;
+                }
+            """)
+            button_box.accepted.connect(dialog.accept)
+            layout.addWidget(button_box)
+
+            dialog.exec()
+
+        except (ValueError, ZeroDivisionError):
+            QMessageBox.warning(
+                self,
+                "Invalid Input",
+                "Please enter valid numbers for probabilities and decrease settings."
             )
 
     def get_connection_string(self):
@@ -1379,6 +1653,14 @@ class RareDropTool(QMainWindow):
             if level_distance < 0:
                 raise ValueError("Level distance must be non-negative")
 
+            level_threshold = int(self.level_threshold_input.text().strip())
+            if level_threshold < 0:
+                raise ValueError("Level threshold must be non-negative")
+
+            decrease_pct = float(self.decrease_input.text().strip())
+            if decrease_pct < 0 or decrease_pct > 100:
+                raise ValueError("Decrease percentage must be between 0 and 100")
+
         except ValueError as e:
             QMessageBox.warning(
                 self, "Invalid Input", f"Please check your inputs:\n{str(e)}"
@@ -1423,7 +1705,7 @@ class RareDropTool(QMainWindow):
         # Start worker thread
         country_mixture = self.country_mixture_checkbox.isChecked()
         self.worker = DropRateWorker(
-            self.get_connection_string(), rare_types, probabilities, level_distance, country_mixture
+            self.get_connection_string(), rare_types, probabilities, level_distance, country_mixture, level_threshold, decrease_pct
         )
         self.worker.progress.connect(self.on_progress)
         self.worker.progress_percent.connect(self.on_progress_percent)
