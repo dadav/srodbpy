@@ -1,6 +1,6 @@
 [project]
 name = "srodbpy"
-version = "0.6.0"
+version = "0.7.0"
 description = "Silkroad Online Rare Item Drop Probability Tool"
 readme = "README.md"
 requires-python = ">=3.12"
