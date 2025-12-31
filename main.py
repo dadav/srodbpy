@@ -278,7 +278,7 @@ class DropRateWorker(QThread):
     progress_percent = pyqtSignal(int, str)  # percentage, ETA
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, db_config, rare_types, probabilities, level_distance, country_mixture, level_threshold, decrease_pct):
+    def __init__(self, db_config, rare_types, probabilities, level_distance, country_mixture, level_threshold, decrease_pct, mall_enabled, mall_probability):
         super().__init__()
         self.db_config = db_config
         self.rare_types = rare_types  # List of ('A', 'B', 'C') for enabled types
@@ -287,6 +287,8 @@ class DropRateWorker(QThread):
         self.country_mixture = country_mixture  # Bool: True = allow cross-region, False = same region only
         self.level_threshold = level_threshold  # Monster level threshold - monsters at or below get full probability
         self.decrease_pct = decrease_pct  # Percentage decrease per level above threshold
+        self.mall_enabled = mall_enabled  # Bool: True = enable mall items for unique monsters
+        self.mall_probability = mall_probability  # Float: probability for mall item drops
 
     @staticmethod
     def get_region(country):
@@ -357,6 +359,7 @@ class DropRateWorker(QThread):
             items_by_level_and_type = {}
             item_count = 0
 
+            # Collect rare items (Star/Moon/Sun)
             for rare_type in self.rare_types:
                 if self.country_mixture:
                     items_by_level_and_type[rare_type] = {}
@@ -394,15 +397,39 @@ class DropRateWorker(QThread):
                         items_by_level_and_type[key][item_level].append(item_id)
 
                     if item_count % 100 == 0:
-                        self.progress.emit(f"Collected {item_count} items...")
+                        self.progress.emit(f"Collected {item_count} rare items...")
 
+            # Collect mall items (for unique monsters)
+            # Mall items: NO level filtering, NO region filtering (global items)
+            # All unique monsters can drop ANY mall item regardless of level or region
+            mall_items = []
+            if self.mall_enabled:
+                cursor.execute(
+                    """
+                    SELECT ID
+                    FROM _RefObjCommon
+                    WHERE CodeName128 LIKE 'ITEM_MALL_%'
+                    AND Service = 1
+                    AND TypeID1 = 3
+                """
+                )
+                mall_items_results = cursor.fetchall()
+
+                for (item_id,) in mall_items_results:
+                    item_count += 1
+                    mall_items.append(item_id)
+
+                    if item_count % 100 == 0:
+                        self.progress.emit(f"Collected {item_count} items (including {len(mall_items)} global mall items)...")
+
+            mall_count = len(mall_items) if self.mall_enabled else 0
             self.progress.emit(
-                f"Step 1 complete: Collected {item_count} items organized by level"
+                f"Step 1 complete: Collected {item_count} items ({item_count - mall_count} rare items by level/region, {mall_count} global mall items)"
             )
             self.progress_percent.emit(8, "Loading monsters...")
 
             # Step 1.5: Query all monsters with their levels and countries
-            self.progress.emit("Step 1.5/7: Querying all monsters...")
+            self.progress.emit("Step 1.5/7: Querying regular monsters...")
             cursor.execute("""
                 SELECT c.ID, ch.Lvl, c.Country
                 FROM _RefObjCommon c
@@ -414,16 +441,34 @@ class DropRateWorker(QThread):
             """)
 
             monsters = cursor.fetchall()
-            self.progress.emit(f"Found {len(monsters)} monsters")
+            self.progress.emit(f"Found {len(monsters)} regular monsters")
+
+            # Query unique monsters if mall items are enabled
+            unique_monsters = []
+            if self.mall_enabled:
+                self.progress.emit("Step 1.5/7: Querying unique monsters...")
+                cursor.execute("""
+                    SELECT c.ID, ch.Lvl, c.Country, c.Rarity
+                    FROM _RefObjCommon c
+                    JOIN _RefObjChar ch ON c.Link = ch.ID
+                    WHERE c.CodeName128 LIKE 'MOB_%'
+                    AND c.TypeID1 = 1
+                    AND c.Service = 1
+                    AND c.Rarity = 3
+                    ORDER BY c.ID
+                """)
+                unique_monsters = cursor.fetchall()
+                self.progress.emit(f"Found {len(unique_monsters)} unique monsters (Rarity=3)")
+
             self.progress_percent.emit(12, "Deleting old groups...")
 
-            # Step 2: Delete old rare drop groups from _RefDropItemGroup
-            self.progress.emit("Step 2/7: Deleting old rare drop groups...")
+            # Step 2: Delete old drop groups from _RefDropItemGroup
+            self.progress.emit("Step 2/7: Deleting old drop groups...")
             cursor.execute(
-                "DELETE FROM _RefDropItemGroup WHERE CodeName128 LIKE 'RARE_%'"
+                "DELETE FROM _RefDropItemGroup WHERE CodeName128 LIKE 'RARE_%' OR CodeName128 LIKE 'MALL_%'"
             )
             deleted_groups = cursor.rowcount
-            self.progress.emit(f"Deleted {deleted_groups} old rare drop group entries")
+            self.progress.emit(f"Deleted {deleted_groups} old drop group entries")
             self.progress_percent.emit(15, "Creating new groups...")
 
             # Step 3: Create drop groups in _RefDropItemGroup (monster-centric approach)
@@ -502,9 +547,48 @@ class DropRateWorker(QThread):
                     percent = int(15 + (monster_idx / len(monsters)) * 30)  # 15-45%
                     self.progress_percent.emit(percent, "Creating groups...")
                     self.progress.emit(
-                        f"Created groups for {monster_idx}/{len(monsters)} monsters "
+                        f"Created groups for {monster_idx}/{len(monsters)} regular monsters "
                         f"({len(group_entries)} entries, {len(assignments)} assignments)"
                     )
+
+            # Process unique monsters for mall items
+            # Create ONE shared mall items group and assign it to all unique monsters
+            if self.mall_enabled and unique_monsters and mall_items:
+                self.progress.emit(f"Step 3/7: Creating shared mall items group for {len(unique_monsters)} unique monsters...")
+
+                # Create a single shared group for all mall items
+                group_id = next_group_id
+                next_group_id += 1
+                group_name = "MALL_ITEMS_GLOBAL"
+
+                # Equal distribution within group
+                select_ratio = 1.0 / len(mall_items)
+
+                # Add all mall items to the shared group
+                for item_id in mall_items:
+                    group_entries.append(
+                        (1, group_id, group_name, item_id, select_ratio, 0)
+                    )
+
+                self.progress.emit(f"Created shared mall group with {len(mall_items)} items")
+
+                # Assign the same group to all unique monsters
+                drop_ratio = self.mall_probability
+
+                for unique_idx, (monster_id, monster_level, country, rarity) in enumerate(unique_monsters):
+                    # Assign the shared mall items group to this unique monster
+                    assignments.append(
+                        (1, monster_id, group_id, group_name, 0, 1, 1, drop_ratio, 0, 0)
+                    )
+
+                    # Progress tracking
+                    if unique_idx % 100 == 0:
+                        percent = int(30 + (unique_idx / len(unique_monsters)) * 15)  # 30-45%
+                        self.progress_percent.emit(percent, "Assigning mall group...")
+                        self.progress.emit(
+                            f"Assigned mall group to {unique_idx}/{len(unique_monsters)} unique monsters "
+                            f"({len(group_entries)} total entries, {len(assignments)} total assignments)"
+                        )
 
             self.progress.emit(
                 f"Step 3 complete: Created {len(assignments)} groups with {len(group_entries)} total entries"
@@ -579,14 +663,14 @@ class DropRateWorker(QThread):
             )
             self.progress_percent.emit(60, "Deleting old assignments...")
 
-            # Step 4: Delete old rare assignments from _RefMonster_AssignedItemRndDrop
-            self.progress.emit("Step 4/7: Deleting old rare assignments...")
+            # Step 4: Delete old assignments from _RefMonster_AssignedItemRndDrop
+            self.progress.emit("Step 4/7: Deleting old drop assignments...")
             cursor.execute(
-                "DELETE FROM _RefMonster_AssignedItemRndDrop WHERE ItemGroupCodeName128 LIKE 'RARE_%'"
+                "DELETE FROM _RefMonster_AssignedItemRndDrop WHERE ItemGroupCodeName128 LIKE 'RARE_%' OR ItemGroupCodeName128 LIKE 'MALL_%'"
             )
             deleted_assignments = cursor.rowcount
             self.progress.emit(
-                f"Deleted {deleted_assignments} old rare assignment entries"
+                f"Deleted {deleted_assignments} old drop assignment entries"
             )
             self.progress_percent.emit(65, "Inserting assignments...")
 
@@ -800,6 +884,26 @@ class RareDropTool(QMainWindow):
         sun_layout.addStretch()
         form_layout.addRow(sun_label, sun_layout)
 
+        # Uniques / Mall Items
+        mall_label = QLabel("Uniques / Mall Items:")
+        mall_label.setStyleSheet(label_style)
+        mall_layout = QHBoxLayout()
+        mall_layout.setSpacing(10)
+        mall_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.mall_checkbox = QCheckBox("Enable")
+        self.mall_checkbox.setChecked(False)
+        self.mall_checkbox.setStyleSheet("font-size: 11pt;")
+        self.mall_checkbox.setFixedWidth(80)
+        self.mall_prob_input = QLineEdit("0.01")
+        self.mall_prob_input.setPlaceholderText("0.01 for 1%")
+        self.mall_prob_input.setMinimumHeight(35)
+        self.mall_prob_input.setFixedWidth(200)
+        self.mall_prob_input.setStyleSheet("font-size: 12pt; padding: 5px;")
+        mall_layout.addWidget(self.mall_checkbox, 0, Qt.AlignmentFlag.AlignVCenter)
+        mall_layout.addWidget(self.mall_prob_input, 0, Qt.AlignmentFlag.AlignVCenter)
+        mall_layout.addStretch()
+        form_layout.addRow(mall_label, mall_layout)
+
         # Level distance
         distance_label = QLabel("Level Distance (±):")
         distance_label.setStyleSheet(label_style)
@@ -883,14 +987,12 @@ class RareDropTool(QMainWindow):
 
         # Info label
         info_label = QLabel(
-            "Items will be assigned to monsters within ± the level distance.\n"
-            "Example: A level 100 item with distance 10 drops from level 90-110 monsters.\n\n"
-            "Region mixture: When enabled, monsters can drop items from any region.\n"
-            "When disabled, Chinese monsters (countries 0, 3) drop Chinese items,\n"
-            "and European monsters (country 1) drop European items."
+            "• Rare items: Regular monsters, filtered by ±level distance and region (if enabled)\n"
+            "• Mall items: ALL unique monsters (Rarity=3), no level/region filtering\n"
+            "• Region mixture: Cross-region when enabled, region-specific when disabled (rare items only)"
         )
         info_label.setStyleSheet(
-            "padding: 10px; background-color: #e7f3ff; border-radius: 5px;"
+            "padding: 8px; background-color: #e7f3ff; border-radius: 5px; font-size: 10pt;"
         )
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
@@ -1305,11 +1407,11 @@ class RareDropTool(QMainWindow):
             conn = mssql_python.connect(self.get_connection_string())
             cursor = conn.cursor()
 
-            # Query existing rare drop assignments to detect current configuration
+            # Query existing drop assignments to detect current configuration
             cursor.execute("""
                 SELECT DISTINCT ItemGroupCodeName128, DropRatio
                 FROM _RefMonster_AssignedItemRndDrop
-                WHERE ItemGroupCodeName128 LIKE 'RARE_%'
+                WHERE ItemGroupCodeName128 LIKE 'RARE_%' OR ItemGroupCodeName128 LIKE 'MALL_%'
             """)
 
             results = cursor.fetchall()
@@ -1327,10 +1429,12 @@ class RareDropTool(QMainWindow):
 
             # Parse results to extract drop ratios by rare type
             rare_configs = {"A": set(), "B": set(), "C": set()}
+            mall_configs = set()
             has_region_code = False
 
             for group_name, drop_ratio in results:
                 # Group names are like: RARE_A_LVL_50, or RARE_A_LVL_50_CN, RARE_A_LVL_50_EU, RARE_A_LVL_50_R2, etc.
+                # or MALL_MOB_12345, MALL_MOB_12345_CN, etc.
                 # Check if any group name contains region code (e.g., _CN, _EU, _R2)
                 parts = group_name.split("_")
                 if len(parts) > 4:  # RARE_A_LVL_50 has 4 parts, with region it has 5+
@@ -1345,6 +1449,8 @@ class RareDropTool(QMainWindow):
                     rare_configs["B"].add(drop_ratio)
                 elif "RARE_C_" in group_name:
                     rare_configs["C"].add(drop_ratio)
+                elif "MALL_" in group_name:
+                    mall_configs.add(drop_ratio)
 
             # Update country mixture checkbox based on detection
             # If groups have region codes, country mixture is disabled
@@ -1385,6 +1491,16 @@ class RareDropTool(QMainWindow):
                 config_summary.append(f"Sun: {sun_ratio_str}")
             else:
                 self.sun_checkbox.setChecked(False)
+
+            # Mall Items (for unique monsters)
+            if mall_configs:
+                mall_ratio = list(mall_configs)[0]
+                mall_ratio_str = f"{mall_ratio:.6g}"
+                self.mall_checkbox.setChecked(True)
+                self.mall_prob_input.setText(mall_ratio_str)
+                config_summary.append(f"Mall: {mall_ratio_str}")
+            else:
+                self.mall_checkbox.setChecked(False)
 
             # Use level distance from saved config (no longer detect from database)
             try:
@@ -1570,11 +1686,19 @@ class RareDropTool(QMainWindow):
                 rare_types.append("C")
                 probabilities["C"] = prob
 
-            if not rare_types:
+            # Check for mall items
+            mall_enabled = self.mall_checkbox.isChecked()
+            mall_probability = 0.0
+            if mall_enabled:
+                mall_probability = float(self.mall_prob_input.text().strip())
+                if mall_probability <= 0 or mall_probability > 1:
+                    raise ValueError("Mall items probability must be between 0 and 1")
+
+            if not rare_types and not mall_enabled:
                 QMessageBox.warning(
                     self,
                     "No Types Selected",
-                    "Please select at least one rare item type.",
+                    "Please select at least one drop type (rare items or mall items).",
                 )
                 return
 
@@ -1597,17 +1721,28 @@ class RareDropTool(QMainWindow):
             return
 
         # Confirm action
-        types_str = ", ".join([f"{t}_RARE" for t in rare_types])
-        country_mixture = self.country_mixture_checkbox.isChecked()
-        region_mode = "Cross-region drops enabled" if country_mixture else "Region-aware (Chinese/European separation)"
+        drop_config_lines = []
+
+        if rare_types:
+            types_str = ", ".join([f"{t}_RARE" for t in rare_types])
+            country_mixture = self.country_mixture_checkbox.isChecked()
+            region_mode = "Cross-region" if country_mixture else "Region-aware"
+            drop_config_lines.append(f"Rare items: {types_str}")
+            drop_config_lines.append(f"  Level distance: ±{level_distance}")
+            drop_config_lines.append(f"  Region mode: {region_mode}")
+
+        if mall_enabled:
+            drop_config_lines.append(f"Mall items: ALL (global pool, no level/region filtering)")
+            drop_config_lines.append(f"  Assigned to: Unique monsters (Rarity=3)")
+            drop_config_lines.append(f"  Drop rate: {mall_probability}")
+
+        config_summary = "\n".join(drop_config_lines)
 
         reply = QMessageBox.question(
             self,
             "Confirm Action",
-            f"This will update drop rates for:\n{types_str}\n\n"
-            f"Level distance: ±{level_distance}\n"
-            f"Region mode: {region_mode}\n\n"
-            f"⚠️  This operation will DELETE existing drop entries for these items.\n\n"
+            f"This will update drop rates:\n\n{config_summary}\n\n"
+            f"⚠️  This operation will DELETE existing drop entries.\n\n"
             f"✓  A backup will be created automatically before applying changes.\n"
             f"✓  You can restore from backup at any time.\n\n"
             f"Do you want to continue?",
@@ -1634,7 +1769,7 @@ class RareDropTool(QMainWindow):
         # Start worker thread
         country_mixture = self.country_mixture_checkbox.isChecked()
         self.worker = DropRateWorker(
-            self.get_connection_string(), rare_types, probabilities, level_distance, country_mixture, level_threshold, decrease_pct
+            self.get_connection_string(), rare_types, probabilities, level_distance, country_mixture, level_threshold, decrease_pct, mall_enabled, mall_probability
         )
         self.worker.progress.connect(self.on_progress)
         self.worker.progress_percent.connect(self.on_progress_percent)
