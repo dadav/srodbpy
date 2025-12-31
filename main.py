@@ -550,8 +550,26 @@ class DropRateWorker(QThread):
                 cursor.execute(insert_sql, params)
                 inserted_items += len(batch)
 
+                # Calculate ETA for group insertion
                 percentage = 45 + int((inserted_items / len(group_entries)) * 15)  # 45-60%
-                self.progress_percent.emit(percentage, "Inserting groups...")
+                elapsed_time = time.time() - start_time
+                if inserted_items > 0:
+                    time_per_insert = elapsed_time / inserted_items
+                    remaining = len(group_entries) - inserted_items
+                    eta_seconds = int(time_per_insert * remaining)
+
+                    if eta_seconds < 60:
+                        eta_str = f"{eta_seconds}s"
+                    elif eta_seconds < 3600:
+                        eta_str = f"{eta_seconds // 60}m {eta_seconds % 60}s"
+                    else:
+                        hours = eta_seconds // 3600
+                        minutes = (eta_seconds % 3600) // 60
+                        eta_str = f"{hours}h {minutes}m"
+                else:
+                    eta_str = "Calculating..."
+
+                self.progress_percent.emit(percentage, f"ETA: {eta_str}")
                 self.progress.emit(
                     f"Inserted {inserted_items}/{len(group_entries)} group item entries"
                 )
@@ -785,7 +803,7 @@ class RareDropTool(QMainWindow):
         # Level distance
         distance_label = QLabel("Level Distance (±):")
         distance_label.setStyleSheet(label_style)
-        self.level_distance_input = QLineEdit("10")
+        self.level_distance_input = QLineEdit(self.saved_level_distance)
         self.level_distance_input.setPlaceholderText("e.g., 10")
         self.level_distance_input.setMinimumHeight(35)
         self.level_distance_input.setFixedWidth(200)
@@ -967,6 +985,7 @@ class RareDropTool(QMainWindow):
             "password": "",
             "level_threshold": "0",
             "decrease_pct": "0",
+            "level_distance": "10",
         }
 
         if os.path.exists(self.CONFIG_FILE):
@@ -980,6 +999,7 @@ class RareDropTool(QMainWindow):
                 self.password = config.get("password", default_config["password"])
                 self.saved_level_threshold = config.get("level_threshold", default_config["level_threshold"])
                 self.saved_decrease_pct = config.get("decrease_pct", default_config["decrease_pct"])
+                self.saved_level_distance = config.get("level_distance", default_config["level_distance"])
             except Exception:
                 # If config file is corrupted, use defaults
                 self.server = default_config["server"]
@@ -989,6 +1009,7 @@ class RareDropTool(QMainWindow):
                 self.password = default_config["password"]
                 self.saved_level_threshold = default_config["level_threshold"]
                 self.saved_decrease_pct = default_config["decrease_pct"]
+                self.saved_level_distance = default_config["level_distance"]
         else:
             # Use defaults
             self.server = default_config["server"]
@@ -998,6 +1019,7 @@ class RareDropTool(QMainWindow):
             self.password = default_config["password"]
             self.saved_level_threshold = default_config["level_threshold"]
             self.saved_decrease_pct = default_config["decrease_pct"]
+            self.saved_level_distance = default_config["level_distance"]
 
     def save_config(self):
         """Save database configuration to file."""
@@ -1009,6 +1031,7 @@ class RareDropTool(QMainWindow):
             "password": self.password,
             "level_threshold": self.level_threshold_input.text() if hasattr(self, 'level_threshold_input') else "0",
             "decrease_pct": self.decrease_input.text() if hasattr(self, 'decrease_input') else "0",
+            "level_distance": self.level_distance_input.text() if hasattr(self, 'level_distance_input') else "10",
         }
         try:
             with open(self.CONFIG_FILE, "w") as f:
@@ -1363,11 +1386,12 @@ class RareDropTool(QMainWindow):
             else:
                 self.sun_checkbox.setChecked(False)
 
-            # Try to detect level distance from existing assignments
-            level_distance = self.detect_level_distance()
-            if level_distance is not None:
-                self.level_distance_input.setText(str(level_distance))
+            # Use level distance from saved config (no longer detect from database)
+            try:
+                level_distance = int(self.level_distance_input.text())
                 config_summary.append(f"Level ±{level_distance}")
+            except ValueError:
+                pass
 
             # Add region mixture status to summary
             if has_region_code:
@@ -1392,133 +1416,6 @@ class RareDropTool(QMainWindow):
             # Don't fail startup if we can't load existing config
             # Just use defaults silently or show a subtle warning
             pass
-
-    def detect_level_distance(self):
-        """Detect level distance from existing RARE_* assignments (supports both old and new formats)."""
-        try:
-            conn = mssql_python.connect(self.get_connection_string())
-            cursor = conn.cursor()
-
-            # Check for new format (monster-specific groups with _MOB_ in name)
-            cursor.execute("""
-                SELECT COUNT(*)
-                FROM _RefMonster_AssignedItemRndDrop
-                WHERE ItemGroupCodeName128 LIKE 'RARE_%_MOB_%'
-            """)
-
-            new_format_count = cursor.fetchone()[0]
-
-            if new_format_count > 0:
-                # New format: Sample monster groups and analyze item ranges
-                cursor.execute("""
-                    SELECT DISTINCT TOP 50
-                        a.ItemGroupCodeName128,
-                        a.RefMonsterID
-                    FROM _RefMonster_AssignedItemRndDrop a
-                    WHERE a.ItemGroupCodeName128 LIKE 'RARE_%_MOB_%'
-                    ORDER BY NEWID()
-                """)
-
-                samples = cursor.fetchall()
-                if not samples:
-                    conn.close()
-                    return None
-
-                distances = []
-                for group_name, monster_id in samples:
-                    # Get monster level
-                    cursor.execute("""
-                        SELECT ch.Lvl
-                        FROM _RefObjCommon c
-                        JOIN _RefObjChar ch ON c.Link = ch.ID
-                        WHERE c.ID = ?
-                    """, (monster_id,))
-
-                    result = cursor.fetchone()
-                    if not result:
-                        continue
-                    monster_level = result[0]
-
-                    # Get item levels in this group
-                    cursor.execute("""
-                        SELECT DISTINCT i.ReqLevel1
-                        FROM _RefDropItemGroup g
-                        JOIN _RefObjCommon i ON g.RefItemID = i.ID
-                        WHERE g.CodeName128 = ?
-                        AND i.ReqLevel1 IS NOT NULL
-                    """, (group_name,))
-
-                    item_levels = [row[0] for row in cursor.fetchall()]
-                    if not item_levels:
-                        continue
-
-                    # Calculate distance as max deviation from monster level
-                    min_item_level = min(item_levels)
-                    max_item_level = max(item_levels)
-
-                    distance_to_min = abs(monster_level - min_item_level)
-                    distance_to_max = abs(monster_level - max_item_level)
-                    estimated_distance = max(distance_to_min, distance_to_max)
-
-                    distances.append(estimated_distance)
-
-                conn.close()
-
-                if distances:
-                    from collections import Counter
-                    distance_counts = Counter(distances)
-                    most_common_distance = distance_counts.most_common(1)[0][0]
-                    return most_common_distance if most_common_distance > 0 else None
-
-            else:
-                # Old format: Use existing detection logic (backward compatibility)
-                cursor.execute("""
-                    SELECT
-                        a.ItemGroupCodeName128,
-                        MIN(ch.Lvl) as MinMonsterLevel,
-                        MAX(ch.Lvl) as MaxMonsterLevel
-                    FROM _RefMonster_AssignedItemRndDrop a
-                    JOIN _RefObjCommon c ON a.RefMonsterID = c.ID
-                    JOIN _RefObjChar ch ON c.Link = ch.ID
-                    WHERE a.ItemGroupCodeName128 LIKE 'RARE_%'
-                    GROUP BY a.ItemGroupCodeName128
-                """)
-
-                results = cursor.fetchall()
-                conn.close()
-
-                if not results:
-                    return None
-
-                # Calculate distance based on monster level range for each group
-                distances = []
-                for group_name, min_monster_level, max_monster_level in results:
-                    # Extract level from group name: RARE_A_LVL_50 → 50 or RARE_A_LVL_50_CN → 50
-                    try:
-                        parts = group_name.split("_LVL_")
-                        if len(parts) >= 2:
-                            level_part = parts[1].split("_")[0]
-                            item_level = int(level_part)
-
-                            if 20 <= item_level <= 110:
-                                distance_from_min = abs(item_level - min_monster_level)
-                                distance_from_max = abs(item_level - max_monster_level)
-                                estimated_distance = max(distance_from_min, distance_from_max)
-                                distances.append(estimated_distance)
-                    except (ValueError, IndexError):
-                        continue
-
-                if distances:
-                    from collections import Counter
-                    distance_counts = Counter(distances)
-                    most_common_distance = distance_counts.most_common(1)[0][0]
-                    return most_common_distance if most_common_distance > 0 else None
-
-            return None
-
-        except Exception:
-            # If detection fails, return None to keep default
-            return None
 
     def create_backup(self):
         """Create/update backup of the drop table."""
@@ -1765,6 +1662,8 @@ class RareDropTool(QMainWindow):
         self.eta_label.setText(" ")
 
         if success:
+            # Save config to remember settings for next startup
+            self.save_config()
             QMessageBox.information(self, "Success", message)
             self.status_label.setText("Operation completed successfully")
             self.status_label.setStyleSheet(
