@@ -160,6 +160,24 @@ class BackupWorker(QThread):
             )
             assignment_count = cursor.fetchone()[0]
 
+            self.progress.emit("Creating backup of mall items (CanDrop column)...")
+
+            # Backup _RefObjCommon for ITEM_MALL items only
+            cursor.execute("""
+                IF OBJECT_ID('_RefObjCommon_Backup', 'U') IS NOT NULL
+                    DROP TABLE _RefObjCommon_Backup
+            """)
+
+            cursor.execute("""
+                SELECT *
+                INTO _RefObjCommon_Backup
+                FROM _RefObjCommon
+                WHERE CodeName128 LIKE 'ITEM_MALL_%'
+            """)
+
+            cursor.execute("SELECT COUNT(*) FROM _RefObjCommon_Backup")
+            mall_item_count = cursor.fetchone()[0]
+
             conn.commit()
             conn.close()
 
@@ -167,7 +185,8 @@ class BackupWorker(QThread):
                 True,
                 f"Backup created successfully!\n\n"
                 f"Drop groups backed up: {group_count}\n"
-                f"Assignments backed up: {assignment_count}",
+                f"Assignments backed up: {assignment_count}\n"
+                f"Mall items backed up: {mall_item_count}",
             )
 
         except Exception as e:
@@ -211,6 +230,16 @@ class RestoreWorker(QThread):
             if cursor.fetchone()[0] == 0:
                 raise Exception(
                     "No assignment backup found! Please create a backup first."
+                )
+
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM INFORMATION_SCHEMA.TABLES
+                WHERE TABLE_NAME = '_RefObjCommon_Backup'
+            """)
+            if cursor.fetchone()[0] == 0:
+                raise Exception(
+                    "No mall items backup found! Please create a backup first."
                 )
 
             # Check if backups have any data
@@ -257,6 +286,20 @@ class RestoreWorker(QThread):
             cursor.execute("SELECT COUNT(*) FROM _RefMonster_AssignedItemRndDrop")
             assignment_count = cursor.fetchone()[0]
 
+            self.progress.emit("Restoring mall items (CanDrop column) from backup...")
+
+            # Delete current ITEM_MALL rows from _RefObjCommon
+            cursor.execute("DELETE FROM _RefObjCommon WHERE CodeName128 LIKE 'ITEM_MALL_%'")
+
+            # Restore ITEM_MALL items from backup
+            cursor.execute("""
+                INSERT INTO _RefObjCommon
+                SELECT * FROM _RefObjCommon_Backup
+            """)
+
+            cursor.execute("SELECT COUNT(*) FROM _RefObjCommon WHERE CodeName128 LIKE 'ITEM_MALL_%'")
+            mall_item_count = cursor.fetchone()[0]
+
             conn.commit()
             conn.close()
 
@@ -264,7 +307,8 @@ class RestoreWorker(QThread):
                 True,
                 f"Restore completed successfully!\n\n"
                 f"Drop groups restored: {group_count}\n"
-                f"Assignments restored: {assignment_count}",
+                f"Assignments restored: {assignment_count}\n"
+                f"Mall items restored: {mall_item_count}",
             )
 
         except Exception as e:
@@ -314,9 +358,9 @@ class DropRateWorker(QThread):
             cursor.execute("""
                 SELECT COUNT(*)
                 FROM INFORMATION_SCHEMA.TABLES
-                WHERE TABLE_NAME IN ('_RefDropItemGroup_Backup', '_RefMonster_AssignedItemRndDrop_Backup')
+                WHERE TABLE_NAME IN ('_RefDropItemGroup_Backup', '_RefMonster_AssignedItemRndDrop_Backup', '_RefObjCommon_Backup')
             """)
-            backup_exists = cursor.fetchone()[0] >= 2
+            backup_exists = cursor.fetchone()[0] >= 3
 
             if not backup_exists:
                 self.progress.emit(
@@ -346,13 +390,25 @@ class DropRateWorker(QThread):
                     FROM _RefMonster_AssignedItemRndDrop
                 """)
 
+                # Create backup of mall items (ITEM_MALL rows only to preserve original CanDrop state)
+                cursor.execute("""
+                    IF OBJECT_ID('_RefObjCommon_Backup', 'U') IS NOT NULL
+                        DROP TABLE _RefObjCommon_Backup
+                """)
+                cursor.execute("""
+                    SELECT *
+                    INTO _RefObjCommon_Backup
+                    FROM _RefObjCommon
+                    WHERE CodeName128 LIKE 'ITEM_MALL_%'
+                """)
+
                 self.progress.emit("Backup created successfully")
 
             # Step 1: Collect items and organize by level for lookup
             if self.country_mixture:
-                self.progress.emit("Step 1/6: Collecting items and organizing by level (region mixture enabled)...")
+                self.progress.emit("Step 1/8: Collecting items and organizing by level (region mixture enabled)...")
             else:
-                self.progress.emit("Step 1/6: Collecting items and organizing by level and region...")
+                self.progress.emit("Step 1/8: Collecting items and organizing by level and region...")
             self.progress_percent.emit(5, "Analyzing...")
 
             # Dictionary structure for quick lookup: {rare_type: {level: [item_ids]}} or {(rare_type, region): {level: [item_ids]}}
@@ -428,8 +484,48 @@ class DropRateWorker(QThread):
             )
             self.progress_percent.emit(8, "Loading monsters...")
 
-            # Step 1.5: Query all monsters with their levels and countries
-            self.progress.emit("Step 1.5/7: Querying regular monsters...")
+            # Step 1.5: Ensure CanDrop enabled for mall items (only if unique monsters enabled)
+            total_updated = 0
+            if self.mall_enabled and mall_items:
+                self.progress.emit("Step 1.5/8: Ensuring CanDrop enabled for mall items...")
+                self.progress_percent.emit(9, "Updating CanDrop...")
+
+                # Update CanDrop for mall items in batches
+                item_ids_list = list(mall_items)
+                batch_size = 500  # Safe limit for SQL Server IN clause
+
+                for i in range(0, len(item_ids_list), batch_size):
+                    batch = item_ids_list[i:i + batch_size]
+
+                    if batch:  # Safety check
+                        placeholders = ','.join(['?'] * len(batch))
+                        update_sql = f"""
+                            UPDATE _RefObjCommon
+                            SET CanDrop = 1
+                            WHERE ID IN ({placeholders})
+                            AND CanDrop != 1
+                        """
+
+                        cursor.execute(update_sql, batch)
+                        total_updated += cursor.rowcount
+
+                        # Progress tracking (every 5 batches to avoid spam)
+                        if (i // batch_size) % 5 == 0:
+                            self.progress.emit(
+                                f"Checked {min(i + batch_size, len(item_ids_list))}/{len(item_ids_list)} mall items for CanDrop..."
+                            )
+
+                if total_updated > 0:
+                    self.progress.emit(f"Updated CanDrop=1 for {total_updated} mall items")
+                else:
+                    self.progress.emit("All mall items already have CanDrop=1 - no updates needed")
+
+                self.progress_percent.emit(10, "Loading monsters...")
+            else:
+                self.progress_percent.emit(10, "Loading monsters...")
+
+            # Step 2: Query all monsters with their levels and countries
+            self.progress.emit("Step 2/8: Querying regular monsters...")
             cursor.execute("""
                 SELECT c.ID, ch.Lvl, c.Country
                 FROM _RefObjCommon c
@@ -446,7 +542,7 @@ class DropRateWorker(QThread):
             # Query unique monsters if mall items are enabled
             unique_monsters = []
             if self.mall_enabled:
-                self.progress.emit("Step 1.5/7: Querying unique monsters...")
+                self.progress.emit("Step 2/8: Querying unique monsters...")
                 cursor.execute("""
                     SELECT c.ID, ch.Lvl, c.Country, c.Rarity
                     FROM _RefObjCommon c
@@ -462,8 +558,8 @@ class DropRateWorker(QThread):
 
             self.progress_percent.emit(12, "Deleting old groups...")
 
-            # Step 2: Delete old drop groups from _RefDropItemGroup
-            self.progress.emit("Step 2/7: Deleting old drop groups...")
+            # Step 3: Delete old drop groups from _RefDropItemGroup
+            self.progress.emit("Step 3/8: Deleting old drop groups...")
             cursor.execute(
                 "DELETE FROM _RefDropItemGroup WHERE CodeName128 LIKE 'RARE_%' OR CodeName128 LIKE 'MALL_%'"
             )
@@ -471,8 +567,8 @@ class DropRateWorker(QThread):
             self.progress.emit(f"Deleted {deleted_groups} old drop group entries")
             self.progress_percent.emit(15, "Creating new groups...")
 
-            # Step 3: Create drop groups in _RefDropItemGroup (monster-centric approach)
-            self.progress.emit("Step 3/7: Creating drop groups organized by monster...")
+            # Step 4: Create drop groups in _RefDropItemGroup (monster-centric approach)
+            self.progress.emit("Step 4/8: Creating drop groups organized by monster...")
 
             # Get next available group ID
             cursor.execute("SELECT MAX(RefItemGroupID) FROM _RefDropItemGroup")
@@ -554,7 +650,7 @@ class DropRateWorker(QThread):
             # Process unique monsters for mall items
             # Create ONE shared mall items group and assign it to all unique monsters
             if self.mall_enabled and unique_monsters and mall_items:
-                self.progress.emit(f"Step 3/7: Creating shared mall items group for {len(unique_monsters)} unique monsters...")
+                self.progress.emit(f"Step 4/8: Creating shared mall items group for {len(unique_monsters)} unique monsters...")
 
                 # Create a single shared group for all mall items
                 group_id = next_group_id
@@ -663,8 +759,8 @@ class DropRateWorker(QThread):
             )
             self.progress_percent.emit(60, "Deleting old assignments...")
 
-            # Step 4: Delete old assignments from _RefMonster_AssignedItemRndDrop
-            self.progress.emit("Step 4/7: Deleting old drop assignments...")
+            # Step 5: Delete old assignments from _RefMonster_AssignedItemRndDrop
+            self.progress.emit("Step 5/8: Deleting old drop assignments...")
             cursor.execute(
                 "DELETE FROM _RefMonster_AssignedItemRndDrop WHERE ItemGroupCodeName128 LIKE 'RARE_%' OR ItemGroupCodeName128 LIKE 'MALL_%'"
             )
@@ -674,9 +770,9 @@ class DropRateWorker(QThread):
             )
             self.progress_percent.emit(65, "Inserting assignments...")
 
-            # Step 5: Insert assignments in _RefMonster_AssignedItemRndDrop
+            # Step 6: Insert assignments in _RefMonster_AssignedItemRndDrop
             self.progress.emit(
-                f"Step 5/7: Inserting {len(assignments)} assignments in _RefMonster_AssignedItemRndDrop..."
+                f"Step 6/8: Inserting {len(assignments)} assignments in _RefMonster_AssignedItemRndDrop..."
             )
 
             # Insert assignments in batches (assignments already created in Step 3)
@@ -755,8 +851,8 @@ class DropRateWorker(QThread):
             )
             self.progress_percent.emit(90, "Committing...")
 
-            # Step 6: Commit changes
-            self.progress.emit("Step 6/7: Committing changes to database...")
+            # Step 7: Commit changes
+            self.progress.emit("Step 7/8: Committing changes to database...")
             conn.commit()
             conn.close()
 
@@ -772,6 +868,7 @@ class DropRateWorker(QThread):
             summary = (
                 f"Successfully updated drop rates in {elapsed_str}!\n\n"
                 f"Items processed: {item_count}\n"
+                f"Mall items with CanDrop updated: {total_updated}\n"
                 f"Drop groups created: {len(assignments)}\n"
                 f"Monster-group assignments: {len(assignments)}\n"
                 f"Group entries in database: {len(group_entries)}"
@@ -1370,13 +1467,13 @@ class RareDropTool(QMainWindow):
             conn = mssql_python.connect(self.get_connection_string())
             cursor = conn.cursor()
 
-            # Check if both backup tables exist
+            # Check if all backup tables exist
             cursor.execute("""
                 SELECT COUNT(*)
                 FROM INFORMATION_SCHEMA.TABLES
-                WHERE TABLE_NAME IN ('_RefDropItemGroup_Backup', '_RefMonster_AssignedItemRndDrop_Backup')
+                WHERE TABLE_NAME IN ('_RefDropItemGroup_Backup', '_RefMonster_AssignedItemRndDrop_Backup', '_RefObjCommon_Backup')
             """)
-            backup_exists = cursor.fetchone()[0] >= 2  # Both tables must exist
+            backup_exists = cursor.fetchone()[0] >= 3  # All three tables must exist
 
             conn.close()
 
@@ -1542,9 +1639,10 @@ class RareDropTool(QMainWindow):
             "Note: Backups are automatically created before applying changes,\n"
             "but you can manually update the backup here if needed.\n\n"
             "Backup tables:\n"
-            "• _RefDropItemGroup_Backup\n"
-            "• _RefMonster_AssignedItemRndDrop_Backup\n\n"
-            "⚠️  ALL rows will be backed up (not just RARE_* entries).\n\n"
+            "• _RefDropItemGroup_Backup (all rows)\n"
+            "• _RefMonster_AssignedItemRndDrop_Backup (all rows)\n"
+            "• _RefObjCommon_Backup (ITEM_MALL items only)\n\n"
+            "⚠️  Existing backups will be replaced.\n\n"
             "Continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
