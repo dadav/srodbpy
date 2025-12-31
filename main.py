@@ -346,18 +346,21 @@ class DropRateWorker(QThread):
 
                 self.progress.emit("Backup created successfully")
 
-            # Step 1: Collect items and organize by (rare_type, level) or (rare_type, level, region)
+            # Step 1: Collect items and organize by level for lookup
             if self.country_mixture:
                 self.progress.emit("Step 1/6: Collecting items and organizing by level (region mixture enabled)...")
             else:
                 self.progress.emit("Step 1/6: Collecting items and organizing by level and region...")
             self.progress_percent.emit(5, "Analyzing...")
 
-            # Dictionary: {(rare_type, level) or (rare_type, level, region): [item_ids]}
-            items_by_type_level = {}
+            # Dictionary structure for quick lookup: {rare_type: {level: [item_ids]}} or {(rare_type, region): {level: [item_ids]}}
+            items_by_level_and_type = {}
             item_count = 0
 
             for rare_type in self.rare_types:
+                if self.country_mixture:
+                    items_by_level_and_type[rare_type] = {}
+
                 cursor.execute(
                     """
                     SELECT ID, ReqLevel1, Country
@@ -373,27 +376,49 @@ class DropRateWorker(QThread):
 
                 for item_id, item_level, country in items:
                     item_count += 1
-                    # Organize by region if country_mixture is disabled
-                    if self.country_mixture:
-                        key = (rare_type, item_level)
-                    else:
-                        region = self.get_region(country)
-                        key = (rare_type, item_level, region)
 
-                    if key not in items_by_type_level:
-                        items_by_type_level[key] = []
-                    items_by_type_level[key].append(item_id)
+                    if self.country_mixture:
+                        # No region filtering
+                        if item_level not in items_by_level_and_type[rare_type]:
+                            items_by_level_and_type[rare_type][item_level] = []
+                        items_by_level_and_type[rare_type][item_level].append(item_id)
+                    else:
+                        # With region filtering
+                        region = self.get_region(country)
+                        key = (rare_type, region)
+
+                        if key not in items_by_level_and_type:
+                            items_by_level_and_type[key] = {}
+                        if item_level not in items_by_level_and_type[key]:
+                            items_by_level_and_type[key][item_level] = []
+                        items_by_level_and_type[key][item_level].append(item_id)
 
                     if item_count % 100 == 0:
                         self.progress.emit(f"Collected {item_count} items...")
 
             self.progress.emit(
-                f"Step 1 complete: {item_count} items organized into {len(items_by_type_level)} groups"
+                f"Step 1 complete: Collected {item_count} items organized by level"
             )
-            self.progress_percent.emit(10, "Deleting old groups...")
+            self.progress_percent.emit(8, "Loading monsters...")
+
+            # Step 1.5: Query all monsters with their levels and countries
+            self.progress.emit("Step 1.5/7: Querying all monsters...")
+            cursor.execute("""
+                SELECT c.ID, ch.Lvl, c.Country
+                FROM _RefObjCommon c
+                JOIN _RefObjChar ch ON c.Link = ch.ID
+                WHERE c.CodeName128 LIKE 'MOB_%'
+                AND c.TypeID1 = 1
+                AND c.Service = 1
+                ORDER BY c.ID
+            """)
+
+            monsters = cursor.fetchall()
+            self.progress.emit(f"Found {len(monsters)} monsters")
+            self.progress_percent.emit(12, "Deleting old groups...")
 
             # Step 2: Delete old rare drop groups from _RefDropItemGroup
-            self.progress.emit("Step 2/6: Deleting old rare drop groups...")
+            self.progress.emit("Step 2/7: Deleting old rare drop groups...")
             cursor.execute(
                 "DELETE FROM _RefDropItemGroup WHERE CodeName128 LIKE 'RARE_%'"
             )
@@ -401,39 +426,90 @@ class DropRateWorker(QThread):
             self.progress.emit(f"Deleted {deleted_groups} old rare drop group entries")
             self.progress_percent.emit(15, "Creating new groups...")
 
-            # Step 3: Create drop groups in _RefDropItemGroup
-            self.progress.emit("Step 3/6: Creating drop groups in _RefDropItemGroup...")
+            # Step 3: Create drop groups in _RefDropItemGroup (monster-centric approach)
+            self.progress.emit("Step 3/7: Creating drop groups organized by monster...")
 
             # Get next available group ID
             cursor.execute("SELECT MAX(RefItemGroupID) FROM _RefDropItemGroup")
             max_group_id = cursor.fetchone()[0] or 0
             next_group_id = max_group_id + 1
 
-            # Track created groups: {key: group_id} where key is (rare_type, level) or (rare_type, level, region)
-            created_groups = {}
-            group_entries = []  # [(Service, RefItemGroupID, CodeName128, RefItemID, SelectRatio, RefMagicGroupID)]
+            # Track groups and assignments together
+            group_entries = []  # For _RefDropItemGroup
+            assignments = []    # For _RefMonster_AssignedItemRndDrop (create here instead of Step 5)
 
-            for key, item_ids in items_by_type_level.items():
-                group_id = next_group_id
+            for monster_idx, (monster_id, monster_level, country) in enumerate(monsters):
+                region = self.get_region(country)
 
-                # Create group name based on whether country_mixture is enabled
-                if self.country_mixture:
-                    rare_type, level = key
-                    group_name = f"RARE_{rare_type}_LVL_{level}"
-                else:
-                    rare_type, level, region = key
-                    group_name = f"RARE_{rare_type}_LVL_{level}_{region}"
+                for rare_type in self.rare_types:
+                    # Collect items within level distance
+                    min_level = max(0, monster_level - self.level_distance)
+                    max_level = monster_level + self.level_distance
 
-                created_groups[key] = group_id
-                next_group_id += 1
+                    group_items = []
+                    for level in range(min_level, max_level + 1):
+                        if self.country_mixture:
+                            # Get items from any region
+                            items_at_level = items_by_level_and_type[rare_type].get(level, [])
+                        else:
+                            # Get items from same region only
+                            key = (rare_type, region)
+                            if key in items_by_level_and_type:
+                                items_at_level = items_by_level_and_type[key].get(level, [])
+                            else:
+                                items_at_level = []
 
-                # Calculate equal SelectRatio for all items in group
-                select_ratio = 1.0 / len(item_ids)
+                        group_items.extend(items_at_level)
 
-                for item_id in item_ids:
-                    group_entries.append(
-                        (1, group_id, group_name, item_id, select_ratio, 0)
+                    if not group_items:
+                        continue  # Skip if no items in range for this monster+type
+
+                    # Create group
+                    group_id = next_group_id
+                    next_group_id += 1
+
+                    # Group naming
+                    if self.country_mixture:
+                        group_name = f"RARE_{rare_type}_MOB_{monster_id}"
+                    else:
+                        group_name = f"RARE_{rare_type}_MOB_{monster_id}_{region}"
+
+                    # Equal distribution within group
+                    select_ratio = 1.0 / len(group_items)
+
+                    for item_id in group_items:
+                        group_entries.append(
+                            (1, group_id, group_name, item_id, select_ratio, 0)
+                        )
+
+                    # Calculate drop ratio with threshold degradation
+                    drop_ratio = self.probabilities[rare_type]
+                    if self.level_threshold > 0 and self.decrease_pct > 0 and monster_level > self.level_threshold:
+                        levels_above = monster_level - self.level_threshold
+                        decrease_factor = (1 - self.decrease_pct / 100) ** levels_above
+                        adjusted_drop_ratio = drop_ratio * decrease_factor
+                        adjusted_drop_ratio = max(adjusted_drop_ratio, drop_ratio * 0.01)
+                    else:
+                        adjusted_drop_ratio = drop_ratio
+
+                    # Create assignment (exactly 1 per monster+type)
+                    assignments.append(
+                        (1, monster_id, group_id, group_name, 0, 1, 1, adjusted_drop_ratio, 0, 0)
                     )
+
+                # Progress tracking
+                if monster_idx % 100 == 0:
+                    percent = int(15 + (monster_idx / len(monsters)) * 30)  # 15-45%
+                    self.progress_percent.emit(percent, "Creating groups...")
+                    self.progress.emit(
+                        f"Created groups for {monster_idx}/{len(monsters)} monsters "
+                        f"({len(group_entries)} entries, {len(assignments)} assignments)"
+                    )
+
+            self.progress.emit(
+                f"Step 3 complete: Created {len(assignments)} groups with {len(group_entries)} total entries"
+            )
+            self.progress_percent.emit(45, "Inserting groups...")
 
             # Insert groups in batches
             # SQL Server limit: 2100 parameters per query
@@ -474,19 +550,19 @@ class DropRateWorker(QThread):
                 cursor.execute(insert_sql, params)
                 inserted_items += len(batch)
 
-                percentage = 15 + int((inserted_items / len(group_entries)) * 20)
-                self.progress_percent.emit(percentage, "Creating groups...")
+                percentage = 45 + int((inserted_items / len(group_entries)) * 15)  # 45-60%
+                self.progress_percent.emit(percentage, "Inserting groups...")
                 self.progress.emit(
-                    f"Created {inserted_items}/{len(group_entries)} group item entries"
+                    f"Inserted {inserted_items}/{len(group_entries)} group item entries"
                 )
 
             self.progress.emit(
-                f"Step 3 complete: Created {len(created_groups)} groups with {len(group_entries)} total items"
+                f"Group insertion complete: Inserted {len(group_entries)} entries for {len(assignments)} groups"
             )
-            self.progress_percent.emit(35, "Deleting old assignments...")
+            self.progress_percent.emit(60, "Deleting old assignments...")
 
             # Step 4: Delete old rare assignments from _RefMonster_AssignedItemRndDrop
-            self.progress.emit("Step 4/6: Deleting old rare assignments...")
+            self.progress.emit("Step 4/7: Deleting old rare assignments...")
             cursor.execute(
                 "DELETE FROM _RefMonster_AssignedItemRndDrop WHERE ItemGroupCodeName128 LIKE 'RARE_%'"
             )
@@ -494,121 +570,14 @@ class DropRateWorker(QThread):
             self.progress.emit(
                 f"Deleted {deleted_assignments} old rare assignment entries"
             )
-            self.progress_percent.emit(40, "Creating assignments...")
+            self.progress_percent.emit(65, "Inserting assignments...")
 
-            # Step 5: Create assignments in _RefMonster_AssignedItemRndDrop
+            # Step 5: Insert assignments in _RefMonster_AssignedItemRndDrop
             self.progress.emit(
-                "Step 5/6: Creating assignments in _RefMonster_AssignedItemRndDrop..."
+                f"Step 5/7: Inserting {len(assignments)} assignments in _RefMonster_AssignedItemRndDrop..."
             )
 
-            assignments = []  # [(Service, RefMonsterID, RefItemGroupID, ItemGroupCodeName128, Overlap, DropAmountMin, DropAmountMax, DropRatio, param1, param2)]
-
-            for key, group_id in created_groups.items():
-                # Extract rare_type, level, and optionally region from key
-                if self.country_mixture:
-                    rare_type, level = key
-                    group_name = f"RARE_{rare_type}_LVL_{level}"
-                    region_filter = None
-                else:
-                    rare_type, level, region = key
-                    group_name = f"RARE_{rare_type}_LVL_{level}_{region}"
-                    region_filter = region
-
-                drop_ratio = self.probabilities[rare_type]
-
-                min_level = max(0, level - self.level_distance)
-                max_level = level + self.level_distance
-
-                # Find monsters within level range, optionally filtered by region
-                if self.country_mixture:
-                    # No region filtering - all monsters in level range
-                    cursor.execute(
-                        """
-                        SELECT c.ID, ch.Lvl
-                        FROM _RefObjCommon c
-                        JOIN _RefObjChar ch ON c.Link = ch.ID
-                        WHERE c.CodeName128 LIKE 'MOB_%'
-                        AND c.TypeID1 = 1
-                        AND c.Service = 1
-                        AND ch.Lvl BETWEEN ? AND ?
-                    """,
-                        (min_level, max_level),
-                    )
-                else:
-                    # Filter by region - match monsters from same region
-                    if region_filter == "CN":
-                        # Chinese region: country 0 or 3
-                        cursor.execute(
-                            """
-                            SELECT c.ID, ch.Lvl
-                            FROM _RefObjCommon c
-                            JOIN _RefObjChar ch ON c.Link = ch.ID
-                            WHERE c.CodeName128 LIKE 'MOB_%'
-                            AND c.TypeID1 = 1
-                            AND c.Service = 1
-                            AND c.Country IN (0, 3)
-                            AND ch.Lvl BETWEEN ? AND ?
-                        """,
-                            (min_level, max_level),
-                        )
-                    elif region_filter == "EU":
-                        # European region: country 1
-                        cursor.execute(
-                            """
-                            SELECT c.ID, ch.Lvl
-                            FROM _RefObjCommon c
-                            JOIN _RefObjChar ch ON c.Link = ch.ID
-                            WHERE c.CodeName128 LIKE 'MOB_%'
-                            AND c.TypeID1 = 1
-                            AND c.Service = 1
-                            AND c.Country = 1
-                            AND ch.Lvl BETWEEN ? AND ?
-                        """,
-                            (min_level, max_level),
-                        )
-                    else:
-                        # Other regions: extract country code from region name (e.g., R2 -> 2)
-                        country_code = int(region_filter[1:])
-                        cursor.execute(
-                            """
-                            SELECT c.ID, ch.Lvl
-                            FROM _RefObjCommon c
-                            JOIN _RefObjChar ch ON c.Link = ch.ID
-                            WHERE c.CodeName128 LIKE 'MOB_%'
-                            AND c.TypeID1 = 1
-                            AND c.Service = 1
-                            AND c.Country = ?
-                            AND ch.Lvl BETWEEN ? AND ?
-                        """,
-                            (country_code, min_level, max_level),
-                        )
-
-                monsters = cursor.fetchall()
-                for monster_id, monster_level in monsters:
-                    # Calculate adjusted drop ratio based on level threshold
-                    if self.level_threshold > 0 and self.decrease_pct > 0 and monster_level > self.level_threshold:
-                        # Monster is above threshold, apply decreasing probability
-                        levels_above_threshold = monster_level - self.level_threshold
-                        decrease_factor = (1 - self.decrease_pct / 100) ** levels_above_threshold
-                        adjusted_drop_ratio = drop_ratio * decrease_factor
-
-                        # Add minimum floor to prevent extremely tiny values
-                        # Never go below 1% of base rate
-                        adjusted_drop_ratio = max(adjusted_drop_ratio, drop_ratio * 0.01)
-                    else:
-                        # Monster at or below threshold, or feature disabled
-                        adjusted_drop_ratio = drop_ratio
-
-                    assignments.append(
-                        (1, monster_id, group_id, group_name, 0, 1, 1, adjusted_drop_ratio, 0, 0)
-                    )
-
-                if len(created_groups) % 10 == 0:
-                    self.progress.emit(
-                        f"Planned assignments for {len(assignments)} monster-group pairs"
-                    )
-
-            # Insert assignments in batches
+            # Insert assignments in batches (assignments already created in Step 3)
             # SQL Server limit: 2100 parameters per query
             # 10 columns per row = 2100/10 = 210 rows max
             batch_size = 200  # Use 200 for safety margin
@@ -656,7 +625,7 @@ class DropRateWorker(QThread):
                 inserted_assignments += len(batch)
 
                 # Update progress
-                percentage = 40 + int((inserted_assignments / len(assignments)) * 50)
+                percentage = 65 + int((inserted_assignments / len(assignments)) * 25)  # 65-90%
                 elapsed_time = time.time() - start_time
                 if inserted_assignments > 0:
                     time_per_insert = elapsed_time / inserted_assignments
@@ -676,16 +645,16 @@ class DropRateWorker(QThread):
 
                 self.progress_percent.emit(percentage, f"ETA: {eta_str}")
                 self.progress.emit(
-                    f"Created {inserted_assignments}/{len(assignments)} assignments"
+                    f"Inserted {inserted_assignments}/{len(assignments)} assignments"
                 )
 
             self.progress.emit(
-                f"Step 5 complete: Created {len(assignments)} assignments"
+                f"Step 5 complete: Inserted {len(assignments)} assignments"
             )
             self.progress_percent.emit(90, "Committing...")
 
             # Step 6: Commit changes
-            self.progress.emit("Step 6/6: Committing changes to database...")
+            self.progress.emit("Step 6/7: Committing changes to database...")
             conn.commit()
             conn.close()
 
@@ -701,8 +670,9 @@ class DropRateWorker(QThread):
             summary = (
                 f"Successfully updated drop rates in {elapsed_str}!\n\n"
                 f"Items processed: {item_count}\n"
-                f"Drop groups created: {len(created_groups)}\n"
-                f"Monster-group assignments: {len(assignments)}"
+                f"Drop groups created: {len(assignments)}\n"
+                f"Monster-group assignments: {len(assignments)}\n"
+                f"Group entries in database: {len(group_entries)}"
             )
 
             self.finished.emit(True, summary)
@@ -1424,63 +1394,125 @@ class RareDropTool(QMainWindow):
             pass
 
     def detect_level_distance(self):
-        """Detect level distance from existing RARE_* assignments."""
+        """Detect level distance from existing RARE_* assignments (supports both old and new formats)."""
         try:
             conn = mssql_python.connect(self.get_connection_string())
             cursor = conn.cursor()
 
-            # For each unique group, get the min and max monster levels assigned to it
-            # This will accurately reflect the configured level_distance parameter
+            # Check for new format (monster-specific groups with _MOB_ in name)
             cursor.execute("""
-                SELECT
-                    a.ItemGroupCodeName128,
-                    MIN(ch.Lvl) as MinMonsterLevel,
-                    MAX(ch.Lvl) as MaxMonsterLevel
-                FROM _RefMonster_AssignedItemRndDrop a
-                JOIN _RefObjCommon c ON a.RefMonsterID = c.ID
-                JOIN _RefObjChar ch ON c.Link = ch.ID
-                WHERE a.ItemGroupCodeName128 LIKE 'RARE_%'
-                GROUP BY a.ItemGroupCodeName128
+                SELECT COUNT(*)
+                FROM _RefMonster_AssignedItemRndDrop
+                WHERE ItemGroupCodeName128 LIKE 'RARE_%_MOB_%'
             """)
 
-            results = cursor.fetchall()
-            conn.close()
+            new_format_count = cursor.fetchone()[0]
 
-            if not results:
-                return None
+            if new_format_count > 0:
+                # New format: Sample monster groups and analyze item ranges
+                cursor.execute("""
+                    SELECT DISTINCT TOP 50
+                        a.ItemGroupCodeName128,
+                        a.RefMonsterID
+                    FROM _RefMonster_AssignedItemRndDrop a
+                    WHERE a.ItemGroupCodeName128 LIKE 'RARE_%_MOB_%'
+                    ORDER BY NEWID()
+                """)
 
-            # Calculate distance based on monster level range for each group
-            # Filter out edge cases (very low or very high level items)
-            distances = []
-            for group_name, min_monster_level, max_monster_level in results:
-                # Extract level from group name: RARE_A_LVL_50 → 50 or RARE_A_LVL_50_CN → 50
-                try:
-                    # Split by _LVL_ and then take everything before the next underscore or region code
-                    parts = group_name.split("_LVL_")
-                    if len(parts) >= 2:
-                        # Handle both RARE_A_LVL_50 and RARE_A_LVL_50_CN formats
-                        level_part = parts[1].split("_")[0]  # Takes "50" from "50" or "50_CN"
-                        item_level = int(level_part)
+                samples = cursor.fetchall()
+                if not samples:
+                    conn.close()
+                    return None
 
-                        # Filter out edge cases (items at extreme levels where monster coverage is incomplete)
-                        # Focus on items in the middle range (20-110) for accurate detection
-                        if 20 <= item_level <= 110:
-                            # Calculate distance from item level to furthest assigned monster
-                            # This correctly handles asymmetric ranges (e.g., when max(0, level-D) is used)
-                            distance_from_min = abs(item_level - min_monster_level)
-                            distance_from_max = abs(item_level - max_monster_level)
-                            estimated_distance = max(distance_from_min, distance_from_max)
-                            distances.append(estimated_distance)
-                except (ValueError, IndexError):
-                    continue
+                distances = []
+                for group_name, monster_id in samples:
+                    # Get monster level
+                    cursor.execute("""
+                        SELECT ch.Lvl
+                        FROM _RefObjCommon c
+                        JOIN _RefObjChar ch ON c.Link = ch.ID
+                        WHERE c.ID = ?
+                    """, (monster_id,))
 
-            if distances:
-                # Use mode (most common distance) to get the configured value
-                from collections import Counter
-                distance_counts = Counter(distances)
-                most_common_distance = distance_counts.most_common(1)[0][0]
+                    result = cursor.fetchone()
+                    if not result:
+                        continue
+                    monster_level = result[0]
 
-                return most_common_distance if most_common_distance > 0 else None
+                    # Get item levels in this group
+                    cursor.execute("""
+                        SELECT DISTINCT i.ReqLevel1
+                        FROM _RefDropItemGroup g
+                        JOIN _RefObjCommon i ON g.RefItemID = i.ID
+                        WHERE g.CodeName128 = ?
+                        AND i.ReqLevel1 IS NOT NULL
+                    """, (group_name,))
+
+                    item_levels = [row[0] for row in cursor.fetchall()]
+                    if not item_levels:
+                        continue
+
+                    # Calculate distance as max deviation from monster level
+                    min_item_level = min(item_levels)
+                    max_item_level = max(item_levels)
+
+                    distance_to_min = abs(monster_level - min_item_level)
+                    distance_to_max = abs(monster_level - max_item_level)
+                    estimated_distance = max(distance_to_min, distance_to_max)
+
+                    distances.append(estimated_distance)
+
+                conn.close()
+
+                if distances:
+                    from collections import Counter
+                    distance_counts = Counter(distances)
+                    most_common_distance = distance_counts.most_common(1)[0][0]
+                    return most_common_distance if most_common_distance > 0 else None
+
+            else:
+                # Old format: Use existing detection logic (backward compatibility)
+                cursor.execute("""
+                    SELECT
+                        a.ItemGroupCodeName128,
+                        MIN(ch.Lvl) as MinMonsterLevel,
+                        MAX(ch.Lvl) as MaxMonsterLevel
+                    FROM _RefMonster_AssignedItemRndDrop a
+                    JOIN _RefObjCommon c ON a.RefMonsterID = c.ID
+                    JOIN _RefObjChar ch ON c.Link = ch.ID
+                    WHERE a.ItemGroupCodeName128 LIKE 'RARE_%'
+                    GROUP BY a.ItemGroupCodeName128
+                """)
+
+                results = cursor.fetchall()
+                conn.close()
+
+                if not results:
+                    return None
+
+                # Calculate distance based on monster level range for each group
+                distances = []
+                for group_name, min_monster_level, max_monster_level in results:
+                    # Extract level from group name: RARE_A_LVL_50 → 50 or RARE_A_LVL_50_CN → 50
+                    try:
+                        parts = group_name.split("_LVL_")
+                        if len(parts) >= 2:
+                            level_part = parts[1].split("_")[0]
+                            item_level = int(level_part)
+
+                            if 20 <= item_level <= 110:
+                                distance_from_min = abs(item_level - min_monster_level)
+                                distance_from_max = abs(item_level - max_monster_level)
+                                estimated_distance = max(distance_from_min, distance_from_max)
+                                distances.append(estimated_distance)
+                    except (ValueError, IndexError):
+                        continue
+
+                if distances:
+                    from collections import Counter
+                    distance_counts = Counter(distances)
+                    most_common_distance = distance_counts.most_common(1)[0][0]
+                    return most_common_distance if most_common_distance > 0 else None
 
             return None
 

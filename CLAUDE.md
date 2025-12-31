@@ -58,18 +58,32 @@ The tool operates on five main MSSQL tables:
 - `_RefDropItemGroup`: Drop group definitions (group → items with probabilities)
 - `_RefMonster_AssignedItemRndDrop`: Group assignments (monster → group + drop probability)
 
-**Group-based approach**: Instead of assigning individual items to monsters, the tool:
-1. Creates drop groups organized by (rare_type, level) - e.g., RARE_A_LVL_50
-2. Each group contains all rare items at that level with equal SelectRatio
-3. Assigns these groups to monsters within the level range
-4. Significantly reduces database rows (~180 groups vs ~100,000+ individual assignments)
+**Monster-specific group approach** (NEW - v0.5.0+): To fix drop rate multiplication bug, the tool now:
+1. Creates drop groups organized by (monster_id, rare_type) - e.g., RARE_A_MOB_12345
+2. Each group contains ALL items within the monster's level range (level ± distance) with equal SelectRatio
+3. Assigns exactly 3 groups per monster (one for each rare type: Star/A, Moon/B, Sun/C)
+4. Ensures correct drop rates - no multiplication when level_distance > 0
+
+**Why this change?** The old level-based grouping (RARE_A_LVL_50) caused a critical bug:
+- When level_distance > 0, monsters received multiple overlapping group assignments
+- Example: Monster at level 50 with distance=1 received RARE_A_LVL_49, RARE_A_LVL_50, and RARE_A_LVL_51
+- Result: 3× configured drop rate instead of 1× (drop rate multiplication bug)
+- The new approach assigns exactly one group per monster+type, eliminating multiplication
+
+**Database size impact**:
+- Old approach: ~180 groups, ~1,080 group entries, ~84,000 assignments (with distance=10)
+- New approach: ~12,000 groups, ~504,000 group entries, ~12,000 assignments
+- Net increase: ~500KB (6× more rows, but acceptable in absolute terms)
+- Trade-off: Larger database, but correct drop rates
 
 **Critical optimization**: The DropRateWorker uses batch operations:
-1. Collect items and organize by (rare_type, level) combination
-2. DELETE old groups and assignments (LIKE 'RARE_%')
-3. CREATE drop groups in _RefDropItemGroup (batches of 300 rows)
-4. CREATE assignments in _RefMonster_AssignedItemRndDrop (batches of 200 rows)
-5. This reduces 4+ hour operations to minutes
+1. Collect items and organize by level for quick lookup
+2. Query all monsters ONCE with their levels and regions
+3. DELETE old groups and assignments (LIKE 'RARE_%')
+4. For each monster, create 3 groups (Star, Moon, Sun) containing items within level distance
+5. CREATE drop groups in _RefDropItemGroup (batches of 300 rows)
+6. CREATE assignments in _RefMonster_AssignedItemRndDrop (batches of 200 rows)
+7. Processing time: 3-5 minutes for ~4,000 monsters (acceptable performance)
 
 **SQL Server constraint**: Batch sizes are limited by SQL Server's 2100 parameter maximum per query:
 - _RefDropItemGroup: 6 columns → max 350 rows, using 300 for safety
@@ -105,11 +119,14 @@ Items identified by CodeName128 patterns:
 ### Monster Identification
 Monsters identified by `CodeName128 LIKE 'MOB_%'` pattern.
 
-### Level-Based Assignment
-For each drop group at level L with level distance D:
-- Find all monsters with level between `(L - D)` and `(L + D)`
-- Assign the entire group to those monsters with configured drop probability
-- When a monster drops the group, game selects one item randomly based on SelectRatio
+### Monster-Specific Assignment (v0.5.0+)
+For each monster M at level L with level distance D:
+- Create 3 groups (one per enabled rare type: Star/A, Moon/B, Sun/C)
+- Each group contains items from levels `(L - D)` to `(L + D)` of that rare type
+- Group naming: `RARE_{type}_MOB_{monster_id}` or `RARE_{type}_MOB_{monster_id}_{region}`
+- Assign each group to its owner monster with configured drop probability
+- Level threshold degradation: If enabled, monsters above threshold get reduced drop rates
+- When a monster drops a group, game selects one item randomly based on SelectRatio (all items have equal probability)
 
 ### Automatic Backup System
 The tool automatically creates backups BEFORE applying any changes (line 320-342):
@@ -142,15 +159,20 @@ On startup, the tool queries the database to detect existing rare drop configura
 **Detection logic:**
 1. Queries `_RefMonster_AssignedItemRndDrop` for RARE_* groups
 2. Extracts drop ratios for each rare type (A, B, C)
-3. Detects level distance by analyzing monster-item level differences (line 1027-1070):
-   - Samples 20 RARE_* assignments
-   - Extracts item level from group name (e.g., RARE_A_LVL_50 → 50)
-   - Joins with monster levels via `_RefObjChar`
-   - Calculates max level difference (this was the original level_distance parameter)
+3. Detects level distance by analyzing item level ranges (line 1396-1521):
+   - **New format (v0.5.0+)**: Samples 50 random RARE_*_MOB_* groups
+     - Extracts monster ID from group name
+     - Queries item levels within each group
+     - Calculates distance as max deviation from monster level
+     - Uses mode (most common distance) across samples
+   - **Old format (backward compatibility)**: Analyzes RARE_*_LVL_* groups
+     - Extracts item level from group name (e.g., RARE_A_LVL_50 → 50)
+     - Joins with monster levels via `_RefObjChar`
+     - Calculates max level difference
 4. Populates UI fields: checkboxes, probability inputs, and level distance
 5. Displays configuration summary in status label (e.g., "Star: 0.01, Moon: 0.005, Sun: 0.001, Level ±10")
 
-This allows the tool to "remember" previous settings by reading them from the database, making it easier to make incremental adjustments without re-entering all values.
+This allows the tool to "remember" previous settings by reading them from the database, making it easier to make incremental adjustments without re-entering all values. The detection logic supports both old (level-based) and new (monster-specific) group formats for backward compatibility.
 
 ## CI/CD
 
