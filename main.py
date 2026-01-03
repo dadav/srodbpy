@@ -620,7 +620,7 @@ class DropRateWorker(QThread):
 
                     for item_id in group_items:
                         group_entries.append(
-                            (1, group_id, group_name, item_id, select_ratio, 0)
+                            (1, group_id, group_name, item_id, select_ratio, 1)
                         )
 
                     # Calculate drop ratio with threshold degradation
@@ -663,7 +663,7 @@ class DropRateWorker(QThread):
                 # Add all mall items to the shared group
                 for item_id in mall_items:
                     group_entries.append(
-                        (1, group_id, group_name, item_id, select_ratio, 0)
+                        (1, group_id, group_name, item_id, select_ratio, 1)
                     )
 
                 self.progress.emit(f"Created shared mall group with {len(mall_items)} items")
