@@ -20,7 +20,6 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QTextEdit,
-    QScrollArea,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
@@ -307,7 +306,9 @@ class RestoreWorker(QThread):
                 WHERE target.CodeName128 LIKE 'ITEM_MALL_%'
             """)
 
-            cursor.execute("SELECT COUNT(*) FROM _RefObjCommon WHERE CodeName128 LIKE 'ITEM_MALL_%'")
+            cursor.execute(
+                "SELECT COUNT(*) FROM _RefObjCommon WHERE CodeName128 LIKE 'ITEM_MALL_%'"
+            )
             mall_item_count = cursor.fetchone()[0]
 
             self.progress.emit("Restoring drop groups from backup...")
@@ -332,7 +333,9 @@ class RestoreWorker(QThread):
             cursor.execute("SELECT COUNT(*) FROM _RefMonster_AssignedItemRndDrop")
             assignment_count = cursor.fetchone()[0]
 
-            self.progress.emit("Restoring rare equip drop class selector from backup...")
+            self.progress.emit(
+                "Restoring rare equip drop class selector from backup..."
+            )
 
             # Delete current _RefDropClassSel_RareEquip rows
             cursor.execute("DELETE FROM _RefDropClassSel_RareEquip")
@@ -369,17 +372,40 @@ class DropRateWorker(QThread):
     progress_percent = pyqtSignal(int, str)  # percentage, ETA
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, db_config, rare_types, probabilities, level_distance, country_mixture, level_threshold, decrease_pct, mall_enabled, mall_probability):
+    def __init__(
+        self,
+        db_config,
+        rare_types,
+        probabilities,
+        level_distance,
+        country_mixture,
+        level_threshold,
+        decrease_pct,
+        mall_enabled,
+        mall_probability,
+        blue_attributes,
+    ):
         super().__init__()
         self.db_config = db_config
         self.rare_types = rare_types  # List of ('A', 'B', 'C') for enabled types
         self.probabilities = probabilities  # Dict: {'A': 0.01, 'B': 0.02, 'C': 0.03}
         self.level_distance = level_distance
-        self.country_mixture = country_mixture  # Bool: True = allow cross-region, False = same region only
+        self.country_mixture = (
+            country_mixture  # Bool: True = allow cross-region, False = same region only
+        )
         self.level_threshold = level_threshold  # Monster level threshold - monsters at or below get full probability
-        self.decrease_pct = decrease_pct  # Percentage decrease per level above threshold
-        self.mall_enabled = mall_enabled  # Bool: True = enable mall items for unique monsters
-        self.mall_probability = mall_probability  # Float: probability for mall item drops
+        self.decrease_pct = (
+            decrease_pct  # Percentage decrease per level above threshold
+        )
+        self.mall_enabled = (
+            mall_enabled  # Bool: True = enable mall items for unique monsters
+        )
+        self.mall_probability = (
+            mall_probability  # Float: probability for mall item drops
+        )
+        self.blue_attributes = (
+            blue_attributes  # Bool: True = RefMagicGroupID=1, False = RefMagicGroupID=0
+        )
 
     @staticmethod
     def get_region(country):
@@ -464,9 +490,13 @@ class DropRateWorker(QThread):
 
             # Step 1: Collect items and organize by level for lookup
             if self.country_mixture:
-                self.progress.emit("Step 1/9: Collecting items and organizing by level (region mixture enabled)...")
+                self.progress.emit(
+                    "Step 1/9: Collecting items and organizing by level (region mixture enabled)..."
+                )
             else:
-                self.progress.emit("Step 1/9: Collecting items and organizing by level and region...")
+                self.progress.emit(
+                    "Step 1/9: Collecting items and organizing by level and region..."
+                )
             self.progress_percent.emit(5, "Analyzing...")
 
             # Dictionary structure for quick lookup: {rare_type: {level: [item_ids]}} or {(rare_type, region): {level: [item_ids]}}
@@ -534,7 +564,9 @@ class DropRateWorker(QThread):
                     mall_items.append(item_id)
 
                     if item_count % 100 == 0:
-                        self.progress.emit(f"Collected {item_count} items (including {len(mall_items)} global mall items)...")
+                        self.progress.emit(
+                            f"Collected {item_count} items (including {len(mall_items)} global mall items)..."
+                        )
 
             mall_count = len(mall_items) if self.mall_enabled else 0
             self.progress.emit(
@@ -545,7 +577,9 @@ class DropRateWorker(QThread):
             # Step 1.5: Ensure CanDrop enabled for mall items (only if unique monsters enabled)
             total_updated = 0
             if self.mall_enabled and mall_items:
-                self.progress.emit("Step 1.5/9: Ensuring CanDrop enabled for mall items...")
+                self.progress.emit(
+                    "Step 1.5/9: Ensuring CanDrop enabled for mall items..."
+                )
                 self.progress_percent.emit(9, "Updating CanDrop...")
 
                 # Update CanDrop for mall items in batches
@@ -553,10 +587,10 @@ class DropRateWorker(QThread):
                 batch_size = 500  # Safe limit for SQL Server IN clause
 
                 for i in range(0, len(item_ids_list), batch_size):
-                    batch = item_ids_list[i:i + batch_size]
+                    batch = item_ids_list[i : i + batch_size]
 
                     if batch:  # Safety check
-                        placeholders = ','.join(['?'] * len(batch))
+                        placeholders = ",".join(["?"] * len(batch))
                         update_sql = f"""
                             UPDATE _RefObjCommon
                             SET CanDrop = 1
@@ -574,9 +608,13 @@ class DropRateWorker(QThread):
                             )
 
                 if total_updated > 0:
-                    self.progress.emit(f"Updated CanDrop=1 for {total_updated} mall items")
+                    self.progress.emit(
+                        f"Updated CanDrop=1 for {total_updated} mall items"
+                    )
                 else:
-                    self.progress.emit("All mall items already have CanDrop=1 - no updates needed")
+                    self.progress.emit(
+                        "All mall items already have CanDrop=1 - no updates needed"
+                    )
 
                 self.progress_percent.emit(10, "Loading monsters...")
             else:
@@ -612,7 +650,9 @@ class DropRateWorker(QThread):
                     ORDER BY c.ID
                 """)
                 unique_monsters = cursor.fetchall()
-                self.progress.emit(f"Found {len(unique_monsters)} unique monsters (Rarity=3)")
+                self.progress.emit(
+                    f"Found {len(unique_monsters)} unique monsters (Rarity=3)"
+                )
 
             self.progress_percent.emit(12, "Deleting old groups...")
 
@@ -635,9 +675,11 @@ class DropRateWorker(QThread):
 
             # Track groups and assignments together
             group_entries = []  # For _RefDropItemGroup
-            assignments = []    # For _RefMonster_AssignedItemRndDrop (create here instead of Step 5)
+            assignments = []  # For _RefMonster_AssignedItemRndDrop (create here instead of Step 5)
 
-            for monster_idx, (monster_id, monster_level, country) in enumerate(monsters):
+            for monster_idx, (monster_id, monster_level, country) in enumerate(
+                monsters
+            ):
                 region = self.get_region(country)
 
                 for rare_type in self.rare_types:
@@ -649,12 +691,16 @@ class DropRateWorker(QThread):
                     for level in range(min_level, max_level + 1):
                         if self.country_mixture:
                             # Get items from any region
-                            items_at_level = items_by_level_and_type[rare_type].get(level, [])
+                            items_at_level = items_by_level_and_type[rare_type].get(
+                                level, []
+                            )
                         else:
                             # Get items from same region only
                             key = (rare_type, region)
                             if key in items_by_level_and_type:
-                                items_at_level = items_by_level_and_type[key].get(level, [])
+                                items_at_level = items_by_level_and_type[key].get(
+                                    level, []
+                                )
                             else:
                                 items_at_level = []
 
@@ -676,24 +722,51 @@ class DropRateWorker(QThread):
                     # Equal distribution within group
                     select_ratio = 1.0 / len(group_items)
 
+                    # RefMagicGroupID: 1 if blue attributes enabled, 0 otherwise
+                    magic_group_id = 1 if self.blue_attributes else 0
+
                     for item_id in group_items:
                         group_entries.append(
-                            (1, group_id, group_name, item_id, select_ratio, 1)
+                            (
+                                1,
+                                group_id,
+                                group_name,
+                                item_id,
+                                select_ratio,
+                                magic_group_id,
+                            )
                         )
 
                     # Calculate drop ratio with threshold degradation
                     drop_ratio = self.probabilities[rare_type]
-                    if self.level_threshold > 0 and self.decrease_pct > 0 and monster_level > self.level_threshold:
+                    if (
+                        self.level_threshold > 0
+                        and self.decrease_pct > 0
+                        and monster_level > self.level_threshold
+                    ):
                         levels_above = monster_level - self.level_threshold
                         decrease_factor = (1 - self.decrease_pct / 100) ** levels_above
                         adjusted_drop_ratio = drop_ratio * decrease_factor
-                        adjusted_drop_ratio = max(adjusted_drop_ratio, drop_ratio * 0.01)
+                        adjusted_drop_ratio = max(
+                            adjusted_drop_ratio, drop_ratio * 0.01
+                        )
                     else:
                         adjusted_drop_ratio = drop_ratio
 
                     # Create assignment (exactly 1 per monster+type)
                     assignments.append(
-                        (1, monster_id, group_id, group_name, 0, 1, 1, adjusted_drop_ratio, 0, 0)
+                        (
+                            1,
+                            monster_id,
+                            group_id,
+                            group_name,
+                            0,
+                            1,
+                            1,
+                            adjusted_drop_ratio,
+                            0,
+                            0,
+                        )
                     )
 
                 # Progress tracking
@@ -708,7 +781,9 @@ class DropRateWorker(QThread):
             # Process unique monsters for mall items
             # Create ONE shared mall items group and assign it to all unique monsters
             if self.mall_enabled and unique_monsters and mall_items:
-                self.progress.emit(f"Step 4/9: Creating shared mall items group for {len(unique_monsters)} unique monsters...")
+                self.progress.emit(
+                    f"Step 4/9: Creating shared mall items group for {len(unique_monsters)} unique monsters..."
+                )
 
                 # Create a single shared group for all mall items
                 group_id = next_group_id
@@ -718,18 +793,28 @@ class DropRateWorker(QThread):
                 # Equal distribution within group
                 select_ratio = 1.0 / len(mall_items)
 
+                # RefMagicGroupID: 1 if blue attributes enabled, 0 otherwise
+                magic_group_id = 1 if self.blue_attributes else 0
+
                 # Add all mall items to the shared group
                 for item_id in mall_items:
                     group_entries.append(
-                        (1, group_id, group_name, item_id, select_ratio, 1)
+                        (1, group_id, group_name, item_id, select_ratio, magic_group_id)
                     )
 
-                self.progress.emit(f"Created shared mall group with {len(mall_items)} items")
+                self.progress.emit(
+                    f"Created shared mall group with {len(mall_items)} items"
+                )
 
                 # Assign the same group to all unique monsters
                 drop_ratio = self.mall_probability
 
-                for unique_idx, (monster_id, monster_level, country, rarity) in enumerate(unique_monsters):
+                for unique_idx, (
+                    monster_id,
+                    monster_level,
+                    country,
+                    rarity,
+                ) in enumerate(unique_monsters):
                     # Assign the shared mall items group to this unique monster
                     assignments.append(
                         (1, monster_id, group_id, group_name, 0, 1, 1, drop_ratio, 0, 0)
@@ -737,7 +822,9 @@ class DropRateWorker(QThread):
 
                     # Progress tracking
                     if unique_idx % 100 == 0:
-                        percent = int(30 + (unique_idx / len(unique_monsters)) * 15)  # 30-45%
+                        percent = int(
+                            30 + (unique_idx / len(unique_monsters)) * 15
+                        )  # 30-45%
                         self.progress_percent.emit(percent, "Assigning mall group...")
                         self.progress.emit(
                             f"Assigned mall group to {unique_idx}/{len(unique_monsters)} unique monsters "
@@ -789,7 +876,9 @@ class DropRateWorker(QThread):
                 inserted_items += len(batch)
 
                 # Calculate ETA for group insertion
-                percentage = 45 + int((inserted_items / len(group_entries)) * 15)  # 45-60%
+                percentage = 45 + int(
+                    (inserted_items / len(group_entries)) * 15
+                )  # 45-60%
                 elapsed_time = time.time() - start_time
                 if inserted_items > 0:
                     time_per_insert = elapsed_time / inserted_items
@@ -881,7 +970,9 @@ class DropRateWorker(QThread):
                 inserted_assignments += len(batch)
 
                 # Update progress
-                percentage = 65 + int((inserted_assignments / len(assignments)) * 25)  # 65-90%
+                percentage = 65 + int(
+                    (inserted_assignments / len(assignments)) * 25
+                )  # 65-90%
                 elapsed_time = time.time() - start_time
                 if inserted_assignments > 0:
                     time_per_insert = elapsed_time / inserted_assignments
@@ -910,7 +1001,9 @@ class DropRateWorker(QThread):
             self.progress_percent.emit(90, "Disabling old rare drop rates...")
 
             # Step 7: Disable old rare drop rates in _RefDropClassSel_RareEquip
-            self.progress.emit("Step 7/9: Disabling old rare drop rates in drop class selector...")
+            self.progress.emit(
+                "Step 7/9: Disabling old rare drop rates in drop class selector..."
+            )
 
             # Build the UPDATE statement to set ProbGroup columns to 0 based on enabled rare types
             # Pattern: A (Star) = 1, 4, 7, 10, 13, 16, 19, 22, 25, 28, 31
@@ -919,13 +1012,13 @@ class DropRateWorker(QThread):
 
             columns_to_disable = []
             for rare_type in self.rare_types:
-                if rare_type == 'A':
+                if rare_type == "A":
                     # Star: columns 1, 4, 7, 10, 13, 16, 19, 22, 25, 28, 31
                     columns_to_disable.extend([1, 4, 7, 10, 13, 16, 19, 22, 25, 28, 31])
-                elif rare_type == 'B':
+                elif rare_type == "B":
                     # Moon: columns 2, 5, 8, 11, 14, 17, 20, 23, 26, 29
                     columns_to_disable.extend([2, 5, 8, 11, 14, 17, 20, 23, 26, 29])
-                elif rare_type == 'C':
+                elif rare_type == "C":
                     # Sun: columns 3, 6, 9, 12, 15, 18, 21, 24, 27, 30
                     columns_to_disable.extend([3, 6, 9, 12, 15, 18, 21, 24, 27, 30])
 
@@ -1010,10 +1103,14 @@ class RareDropTool(QMainWindow):
 
         # Form layout for inputs
         form_layout = QFormLayout()
-        form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        form_layout.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
         form_layout.setVerticalSpacing(18)
         form_layout.setHorizontalSpacing(15)
-        form_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        form_layout.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
+        )
         # Increase label font size
         label_style = "font-size: 11pt;"
 
@@ -1022,7 +1119,9 @@ class RareDropTool(QMainWindow):
         star_label.setStyleSheet(label_style)
         star_layout = QHBoxLayout()
         star_layout.setSpacing(10)
-        star_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        star_layout.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
         self.star_checkbox = QCheckBox("Enable")
         self.star_checkbox.setChecked(True)
         self.star_checkbox.setStyleSheet("font-size: 11pt;")
@@ -1042,7 +1141,9 @@ class RareDropTool(QMainWindow):
         moon_label.setStyleSheet(label_style)
         moon_layout = QHBoxLayout()
         moon_layout.setSpacing(10)
-        moon_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        moon_layout.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
         self.moon_checkbox = QCheckBox("Enable")
         self.moon_checkbox.setChecked(True)
         self.moon_checkbox.setStyleSheet("font-size: 11pt;")
@@ -1062,7 +1163,9 @@ class RareDropTool(QMainWindow):
         sun_label.setStyleSheet(label_style)
         sun_layout = QHBoxLayout()
         sun_layout.setSpacing(10)
-        sun_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        sun_layout.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
         self.sun_checkbox = QCheckBox("Enable")
         self.sun_checkbox.setChecked(True)
         self.sun_checkbox.setStyleSheet("font-size: 11pt;")
@@ -1082,7 +1185,9 @@ class RareDropTool(QMainWindow):
         mall_label.setStyleSheet(label_style)
         mall_layout = QHBoxLayout()
         mall_layout.setSpacing(10)
-        mall_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        mall_layout.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
         self.mall_checkbox = QCheckBox("Enable")
         self.mall_checkbox.setChecked(False)
         self.mall_checkbox.setStyleSheet("font-size: 11pt;")
@@ -1130,7 +1235,9 @@ class RareDropTool(QMainWindow):
         decrease_label.setStyleSheet(label_style)
         decrease_layout = QHBoxLayout()
         decrease_layout.setSpacing(10)
-        decrease_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        decrease_layout.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
         self.decrease_input = QLineEdit(self.saved_decrease_pct)
         self.decrease_input.setPlaceholderText("0-100")
         self.decrease_input.setMinimumHeight(35)
@@ -1153,7 +1260,9 @@ class RareDropTool(QMainWindow):
         self.show_prob_button.setMinimumHeight(35)
         self.show_prob_button.setStyleSheet("font-size: 11pt; padding: 5px;")
         self.show_prob_button.clicked.connect(self.show_probability_dialog)
-        decrease_layout.addWidget(self.show_prob_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        decrease_layout.addWidget(
+            self.show_prob_button, 0, Qt.AlignmentFlag.AlignVCenter
+        )
         decrease_layout.addStretch()
         form_layout.addRow(decrease_label, decrease_layout)
 
@@ -1162,7 +1271,9 @@ class RareDropTool(QMainWindow):
         region_label.setStyleSheet(label_style)
         region_layout = QHBoxLayout()
         region_layout.setSpacing(10)
-        region_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        region_layout.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
         self.country_mixture_checkbox = QCheckBox("Allow cross-region drops")
         self.country_mixture_checkbox.setChecked(True)
         self.country_mixture_checkbox.setStyleSheet("font-size: 11pt;")
@@ -1172,9 +1283,33 @@ class RareDropTool(QMainWindow):
             "When disabled, monsters only drop items from the same region.\n"
             "Regions: Chinese (countries 0, 3), European (country 1)"
         )
-        region_layout.addWidget(self.country_mixture_checkbox, 0, Qt.AlignmentFlag.AlignVCenter)
+        region_layout.addWidget(
+            self.country_mixture_checkbox, 0, Qt.AlignmentFlag.AlignVCenter
+        )
         region_layout.addStretch()
         form_layout.addRow(region_label, region_layout)
+
+        # Blue attributes
+        blue_attr_label = QLabel("Blue Attributes:")
+        blue_attr_label.setStyleSheet(label_style)
+        blue_attr_layout = QHBoxLayout()
+        blue_attr_layout.setSpacing(10)
+        blue_attr_layout.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.blue_attributes_checkbox = QCheckBox("Drops have blue attrs")
+        self.blue_attributes_checkbox.setChecked(self.saved_blue_attributes)
+        self.blue_attributes_checkbox.setStyleSheet("font-size: 11pt;")
+        self.blue_attributes_checkbox.setMinimumHeight(35)
+        self.blue_attributes_checkbox.setToolTip(
+            "When enabled, dropped items will have blue (magic) attributes (RefMagicGroupID=1).\n"
+            "When disabled, dropped items will have no magic attributes (RefMagicGroupID=0)."
+        )
+        blue_attr_layout.addWidget(
+            self.blue_attributes_checkbox, 0, Qt.AlignmentFlag.AlignVCenter
+        )
+        blue_attr_layout.addStretch()
+        form_layout.addRow(blue_attr_label, blue_attr_layout)
 
         layout.addLayout(form_layout)
 
@@ -1281,6 +1416,7 @@ class RareDropTool(QMainWindow):
             "level_threshold": "0",
             "decrease_pct": "0",
             "level_distance": "10",
+            "blue_attributes": True,
         }
 
         if os.path.exists(self.CONFIG_FILE):
@@ -1292,9 +1428,18 @@ class RareDropTool(QMainWindow):
                 self.database = config.get("database", default_config["database"])
                 self.user = config.get("user", default_config["user"])
                 self.password = config.get("password", default_config["password"])
-                self.saved_level_threshold = config.get("level_threshold", default_config["level_threshold"])
-                self.saved_decrease_pct = config.get("decrease_pct", default_config["decrease_pct"])
-                self.saved_level_distance = config.get("level_distance", default_config["level_distance"])
+                self.saved_level_threshold = config.get(
+                    "level_threshold", default_config["level_threshold"]
+                )
+                self.saved_decrease_pct = config.get(
+                    "decrease_pct", default_config["decrease_pct"]
+                )
+                self.saved_level_distance = config.get(
+                    "level_distance", default_config["level_distance"]
+                )
+                self.saved_blue_attributes = config.get(
+                    "blue_attributes", default_config["blue_attributes"]
+                )
             except Exception:
                 # If config file is corrupted, use defaults
                 self.server = default_config["server"]
@@ -1305,6 +1450,7 @@ class RareDropTool(QMainWindow):
                 self.saved_level_threshold = default_config["level_threshold"]
                 self.saved_decrease_pct = default_config["decrease_pct"]
                 self.saved_level_distance = default_config["level_distance"]
+                self.saved_blue_attributes = default_config["blue_attributes"]
         else:
             # Use defaults
             self.server = default_config["server"]
@@ -1315,6 +1461,7 @@ class RareDropTool(QMainWindow):
             self.saved_level_threshold = default_config["level_threshold"]
             self.saved_decrease_pct = default_config["decrease_pct"]
             self.saved_level_distance = default_config["level_distance"]
+            self.saved_blue_attributes = default_config["blue_attributes"]
 
     def save_config(self):
         """Save database configuration to file."""
@@ -1324,9 +1471,18 @@ class RareDropTool(QMainWindow):
             "database": self.database,
             "user": self.user,
             "password": self.password,
-            "level_threshold": self.level_threshold_input.text() if hasattr(self, 'level_threshold_input') else "0",
-            "decrease_pct": self.decrease_input.text() if hasattr(self, 'decrease_input') else "0",
-            "level_distance": self.level_distance_input.text() if hasattr(self, 'level_distance_input') else "10",
+            "level_threshold": self.level_threshold_input.text()
+            if hasattr(self, "level_threshold_input")
+            else "0",
+            "decrease_pct": self.decrease_input.text()
+            if hasattr(self, "decrease_input")
+            else "0",
+            "level_distance": self.level_distance_input.text()
+            if hasattr(self, "level_distance_input")
+            else "10",
+            "blue_attributes": self.blue_attributes_checkbox.isChecked()
+            if hasattr(self, "blue_attributes_checkbox")
+            else True,
         }
         try:
             with open(self.CONFIG_FILE, "w") as f:
@@ -1375,22 +1531,28 @@ class RareDropTool(QMainWindow):
 
             if self.star_checkbox.isChecked():
                 try:
-                    rare_probabilities['Star'] = float(self.star_prob_input.text().strip() or "0")
-                    rare_names['Star'] = 'Seal of Star'
+                    rare_probabilities["Star"] = float(
+                        self.star_prob_input.text().strip() or "0"
+                    )
+                    rare_names["Star"] = "Seal of Star"
                 except ValueError:
                     pass
 
             if self.moon_checkbox.isChecked():
                 try:
-                    rare_probabilities['Moon'] = float(self.moon_prob_input.text().strip() or "0")
-                    rare_names['Moon'] = 'Seal of Moon'
+                    rare_probabilities["Moon"] = float(
+                        self.moon_prob_input.text().strip() or "0"
+                    )
+                    rare_names["Moon"] = "Seal of Moon"
                 except ValueError:
                     pass
 
             if self.sun_checkbox.isChecked():
                 try:
-                    rare_probabilities['Sun'] = float(self.sun_prob_input.text().strip() or "0")
-                    rare_names['Sun'] = 'Seal of Sun'
+                    rare_probabilities["Sun"] = float(
+                        self.sun_prob_input.text().strip() or "0"
+                    )
+                    rare_names["Sun"] = "Seal of Sun"
                 except ValueError:
                     pass
 
@@ -1398,7 +1560,7 @@ class RareDropTool(QMainWindow):
                 QMessageBox.information(
                     self,
                     "No Rare Types Enabled",
-                    "Please enable at least one rare type to see probability calculations."
+                    "Please enable at least one rare type to see probability calculations.",
                 )
                 return
 
@@ -1412,7 +1574,9 @@ class RareDropTool(QMainWindow):
 
             # Add title
             title_label = QLabel("Drop Probability by Monster Level")
-            title_label.setStyleSheet("font-size: 16pt; font-weight: bold; color: #2c3e50; padding: 10px;")
+            title_label.setStyleSheet(
+                "font-size: 16pt; font-weight: bold; color: #2c3e50; padding: 10px;"
+            )
             layout.addWidget(title_label)
 
             # Create text display for probability table
@@ -1433,7 +1597,15 @@ class RareDropTool(QMainWindow):
             if threshold <= 0 or decrease <= 0:
                 # Show base rates when disabled
                 lines = ["Probability Decrease: DISABLED\n"]
-                lines.append("Monster Level  | " + " | ".join([f"{rare_names[r]:19s}" for r in sorted(rare_probabilities.keys())]))
+                lines.append(
+                    "Monster Level  | "
+                    + " | ".join(
+                        [
+                            f"{rare_names[r]:19s}"
+                            for r in sorted(rare_probabilities.keys())
+                        ]
+                    )
+                )
                 lines.append("=" * (15 + len(rare_probabilities) * 24))
 
                 # Show levels from 10 to 140 in steps of 10
@@ -1442,7 +1614,7 @@ class RareDropTool(QMainWindow):
                     probs = []
                     for rare_type in sorted(rare_probabilities.keys()):
                         base_prob = rare_probabilities[rare_type]
-                        probs.append(f"{base_prob:.6f} ({base_prob*100:.4f}%)")
+                        probs.append(f"{base_prob:.6f} ({base_prob * 100:.4f}%)")
                     lines.append(f"Level {level:3d}     | " + " | ".join(probs))
 
                 prob_text.setPlainText("\n".join(lines))
@@ -1452,8 +1624,18 @@ class RareDropTool(QMainWindow):
                 if threshold not in levels:
                     levels = [threshold] + levels
 
-                lines = [f"Probability Decrease: ENABLED (Threshold: {threshold}, Decrease: {decrease}% per level)\n"]
-                lines.append("Monster Level  | " + " | ".join([f"{rare_names[r]:19s}" for r in sorted(rare_probabilities.keys())]))
+                lines = [
+                    f"Probability Decrease: ENABLED (Threshold: {threshold}, Decrease: {decrease}% per level)\n"
+                ]
+                lines.append(
+                    "Monster Level  | "
+                    + " | ".join(
+                        [
+                            f"{rare_names[r]:19s}"
+                            for r in sorted(rare_probabilities.keys())
+                        ]
+                    )
+                )
                 lines.append("=" * (15 + len(rare_probabilities) * 24))
 
                 for level in levels:
@@ -1469,7 +1651,7 @@ class RareDropTool(QMainWindow):
                         actual_prob = base_prob * decrease_factor
                         # Ensure minimum floor of 1% of base
                         actual_prob = max(actual_prob, base_prob * 0.01)
-                        probs.append(f"{actual_prob:.6f} ({actual_prob*100:.4f}%)")
+                        probs.append(f"{actual_prob:.6f} ({actual_prob * 100:.4f}%)")
 
                     level_label = f"Level {level:3d}"
                     if level > threshold:
@@ -1484,8 +1666,12 @@ class RareDropTool(QMainWindow):
             layout.addWidget(prob_text)
 
             # Add info footer
-            info_label = QLabel("Note: Probabilities shown are actual drop rates that will be applied to the database.")
-            info_label.setStyleSheet("color: #6c757d; font-size: 9pt; font-style: italic; padding: 5px;")
+            info_label = QLabel(
+                "Note: Probabilities shown are actual drop rates that will be applied to the database."
+            )
+            info_label.setStyleSheet(
+                "color: #6c757d; font-size: 9pt; font-style: italic; padding: 5px;"
+            )
             layout.addWidget(info_label)
 
             # Add close button
@@ -1516,7 +1702,7 @@ class RareDropTool(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Invalid Input",
-                "Please enter valid numbers for probabilities and decrease settings."
+                "Please enter valid numbers for probabilities and decrease settings.",
             )
 
     def get_connection_string(self):
@@ -1633,7 +1819,9 @@ class RareDropTool(QMainWindow):
                 if len(parts) > 4:  # RARE_A_LVL_50 has 4 parts, with region it has 5+
                     last_part = parts[-1]
                     # Check for CN, EU, or R<digit> patterns
-                    if last_part in ("CN", "EU") or (last_part.startswith("R") and last_part[1:].isdigit()):
+                    if last_part in ("CN", "EU") or (
+                        last_part.startswith("R") and last_part[1:].isdigit()
+                    ):
                         has_region_code = True
 
                 if "RARE_A_" in group_name:
@@ -1927,8 +2115,10 @@ class RareDropTool(QMainWindow):
             drop_config_lines.append(f"  Region mode: {region_mode}")
 
         if mall_enabled:
-            drop_config_lines.append(f"Mall items: ALL (global pool, no level/region filtering)")
-            drop_config_lines.append(f"  Assigned to: Unique monsters (Rarity=3)")
+            drop_config_lines.append(
+                "Mall items: ALL (global pool, no level/region filtering)"
+            )
+            drop_config_lines.append("  Assigned to: Unique monsters (Rarity=3)")
             drop_config_lines.append(f"  Drop rate: {mall_probability}")
 
         config_summary = "\n".join(drop_config_lines)
@@ -1963,8 +2153,18 @@ class RareDropTool(QMainWindow):
 
         # Start worker thread
         country_mixture = self.country_mixture_checkbox.isChecked()
+        blue_attributes = self.blue_attributes_checkbox.isChecked()
         self.worker = DropRateWorker(
-            self.get_connection_string(), rare_types, probabilities, level_distance, country_mixture, level_threshold, decrease_pct, mall_enabled, mall_probability
+            self.get_connection_string(),
+            rare_types,
+            probabilities,
+            level_distance,
+            country_mixture,
+            level_threshold,
+            decrease_pct,
+            mall_enabled,
+            mall_probability,
+            blue_attributes,
         )
         self.worker.progress.connect(self.on_progress)
         self.worker.progress_percent.connect(self.on_progress_percent)
