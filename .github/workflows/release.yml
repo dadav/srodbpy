@@ -95,7 +95,7 @@ jobs:
           mv release-artifacts/sro-rare-drop-tool "release-artifacts/sro-rare-drop-tool-v${{ steps.tag.outputs.VERSION }}-linux"
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           tag_name: ${{ steps.tag.outputs.TAG_NAME }}
           name: Release ${{ steps.tag.outputs.TAG_NAME }}
